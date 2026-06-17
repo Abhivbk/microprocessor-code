@@ -4,7 +4,6 @@ import time
 import socket
 import json
 import threading
-import tkinter as tk
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import fsds
@@ -41,6 +40,8 @@ car_controls.throttle = 0.0
 car_controls.brake = 1.0
 car_controls.steering = 0.0
 
+client_lock = threading.Lock()
+
 tcp_pub = TcpBroadcastServer(bind_host="0.0.0.0", bind_port=PORT_ACTUATOR_OUT)
 tcp_pub.start()
 
@@ -52,21 +53,32 @@ latest = {
     "timestamp_ms": int(time.time() * 1000),
 }
 
+desired_controls = {
+    "throttle": 0.0,
+    "brake": 1.0,
+    "steering": 0.0,
+    "timestamp_ms": int(time.time() * 1000),
+}
+
 
 def apply_controls(throttle, brake, steering):
     global client
 
-    car_controls.throttle = throttle
-    car_controls.brake = brake
-    car_controls.steering = steering
+    with client_lock:
+        car_controls.throttle = throttle
+        car_controls.brake = brake
+        car_controls.steering = steering
 
-    try:
-        client.setCarControls(car_controls, VEHICLE_NAME)
-    except Exception as e:
-        print(f"[control_input_node] setCarControls failed: {e}")
-        latest["status"] = "Reconnecting FSDS..."
-        client = connect_fsds_forever()
-        client.setCarControls(car_controls, VEHICLE_NAME)
+        try:
+            client.setCarControls(car_controls, VEHICLE_NAME)
+        except Exception as e:
+            print(f"[control_input_node] setCarControls failed: {e}")
+            latest["status"] = "Reconnecting FSDS..."
+            client = connect_fsds_forever()
+            try:
+                client.setCarControls(car_controls, VEHICLE_NAME)
+            except Exception:
+                pass
 
 
 def publish_latest():
@@ -80,7 +92,7 @@ def publish_latest():
 
 
 def handle_client(conn, addr):
-    print(f"[control_input_node] Client connected: {addr}")
+    print(f"[control_input_node] Client connected: {addr}", flush=True)
     latest["status"] = f"Connected: {addr}"
 
     try:
@@ -100,20 +112,10 @@ def handle_client(conn, addr):
             brake = clamp(float(msg.get("brake", 0.0)), 0.0, 1.0)
             steering = clamp(float(msg.get("steering", 0.0)), -1.0, 1.0)
 
-            apply_controls(throttle, brake, steering)
-
-            latest["throttle"] = throttle
-            latest["brake"] = brake
-            latest["steering"] = steering
-            latest["timestamp_ms"] = int(time.time() * 1000)
-            latest["status"] = "Command applied"
-
-            publish_latest()
-
-            print(
-                f"[control_input_node] "
-                f"throttle={throttle:.3f} brake={brake:.3f} steering={steering:.3f}"
-            )
+            desired_controls["throttle"] = throttle
+            desired_controls["brake"] = brake
+            desired_controls["steering"] = steering
+            desired_controls["timestamp_ms"] = int(time.time() * 1000)
 
     except Exception as e:
         print(f"[control_input_node] Client handler error: {e}")
@@ -126,13 +128,47 @@ def handle_client(conn, addr):
         print(f"[control_input_node] Client disconnected: {addr}")
 
 
+def watchdog_and_control_loop():
+    print("[control_input_node] Control loop started", flush=True)
+    while True:
+        time.sleep(0.05)
+        now = int(time.time() * 1000)
+        last_time = desired_controls["timestamp_ms"]
+        
+        is_moving = (latest["throttle"] > 0.0 or latest["brake"] < 1.0)
+        
+        if now - last_time > 300:
+            if is_moving:
+                print("[control_input_node] WATCHDOG TRIGGERED: Active Braking due to packet timeout.", flush=True)
+                apply_controls(0.0, 1.0, 0.0)
+                latest["throttle"] = 0.0
+                latest["brake"] = 1.0
+                latest["steering"] = 0.0
+                latest["timestamp_ms"] = now
+                latest["status"] = "Watchdog active braking"
+                publish_latest()
+        else:
+            t = desired_controls["throttle"]
+            b = desired_controls["brake"]
+            s = desired_controls["steering"]
+            
+            apply_controls(t, b, s)
+            
+            latest["throttle"] = t
+            latest["brake"] = b
+            latest["steering"] = s
+            latest["timestamp_ms"] = now
+            latest["status"] = "Command applied"
+            publish_latest()
+
+
 def server_thread():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT_CONTROL_IN))
     server.listen(5)
 
-    print(f"[control_input_node] Listening on {HOST}:{PORT_CONTROL_IN}")
+    print(f"[control_input_node] Listening on {HOST}:{PORT_CONTROL_IN}", flush=True)
 
     while True:
         try:
@@ -143,59 +179,24 @@ def server_thread():
             time.sleep(1)
 
 
-root = tk.Tk()
-root.title("Control Input Node")
-root.geometry("560x260")
-root.configure(bg="#1a1a1a")
-
-title_label = tk.Label(
-    root,
-    text="Control Input Node",
-    font=("Arial", 18, "bold"),
-    fg="cyan",
-    bg="#1a1a1a"
-)
-title_label.pack(pady=10)
-
-throttle_var = tk.StringVar(value="Throttle: 0.000")
-brake_var = tk.StringVar(value="Brake: 1.000")
-steering_var = tk.StringVar(value="Steering: 0.000")
-status_var = tk.StringVar(value="Status: Listening")
-
-for var in [throttle_var, brake_var, steering_var, status_var]:
-    tk.Label(
-        root,
-        textvariable=var,
-        font=("Arial", 14),
-        fg="white",
-        bg="#1a1a1a",
-        anchor="w"
-    ).pack(fill="x", padx=20, pady=5)
-
-
-def refresh_ui():
-    throttle_var.set(f"Throttle: {latest['throttle']:.3f}")
-    brake_var.set(f"Brake: {latest['brake']:.3f}")
-    steering_var.set(f"Steering: {latest['steering']:.3f}")
-    status_var.set(f"Status: {latest['status']}")
-    root.after(50, refresh_ui)
-
-
-def on_close():
+if __name__ == "__main__":
+    print("[control_input_node] Running in headless mode", flush=True)
+    threading.Thread(target=server_thread, daemon=True).start()
+    threading.Thread(target=watchdog_and_control_loop, daemon=True).start()
     try:
-        car_controls.throttle = 0.0
-        car_controls.brake = 1.0
-        car_controls.steering = 0.0
-        client.setCarControls(car_controls, VEHICLE_NAME)
-        client.enableApiControl(False, VEHICLE_NAME)
-    except Exception:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
         pass
-
-    tcp_pub.stop()
-    root.destroy()
-
-
-threading.Thread(target=server_thread, daemon=True).start()
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.after(100, refresh_ui)
-root.mainloop()
+    finally:
+        try:
+            with client_lock:
+                car_controls.throttle = 0.0
+                car_controls.brake = 1.0
+                car_controls.steering = 0.0
+                client.setCarControls(car_controls, VEHICLE_NAME)
+                client.enableApiControl(False, VEHICLE_NAME)
+        except Exception:
+            pass
+        tcp_pub.stop()
+        print("[control_input_node] Stopped", flush=True)

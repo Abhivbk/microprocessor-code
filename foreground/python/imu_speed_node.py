@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-import tkinter as tk
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import fsds
@@ -66,65 +65,22 @@ def get_packet():
     }
 
 
-root = tk.Tk()
-root.title("IMU + Ground Speed Node")
-root.geometry("760x360")
-root.configure(bg="#1a1a1a")
-
-title_label = tk.Label(
-    root,
-    text="IMU + Ground Speed",
-    font=("Arial", 18, "bold"),
-    fg="cyan",
-    bg="#1a1a1a"
-)
-title_label.pack(pady=10)
-
-speed_var = tk.StringVar(value="Ground speed: 0.000 m/s")
-ang_var = tk.StringVar(value="Angular vel: x=0 y=0 z=0")
-lin_var = tk.StringVar(value="Linear acc: x=0 y=0 z=0")
-ori_var = tk.StringVar(value="Orientation: x=0 y=0 z=0 w=1")
-status_var = tk.StringVar(value="Status: Waiting for FSDS")
-
-for var in [speed_var, ang_var, lin_var, ori_var, status_var]:
-    tk.Label(
-        root,
-        textvariable=var,
-        font=("Arial", 13),
-        fg="white",
-        bg="#1a1a1a",
-        anchor="w",
-        justify="left"
-    ).pack(fill="x", padx=20, pady=6)
-
-
-def update_ui():
+if __name__ == "__main__":
+    print("[imu_speed_node] Running in headless mode", flush=True)
     try:
-        data = get_packet()
-        speed_var.set(f"Ground speed: {data['ground_speed_mps']:.3f} m/s")
+        while True:
+            start_time = time.time()
+            try:
+                data = get_packet()
+                tcp.send_json(data)
+            except Exception as e:
+                print(f"[imu_speed_node] Error: {e}", flush=True)
 
-        av = data["imu"]["angular_velocity"]
-        la = data["imu"]["linear_acceleration"]
-        ori = data["imu"]["orientation"]
-
-        ang_var.set(f"Angular vel: x={av['x']:+.4f}  y={av['y']:+.4f}  z={av['z']:+.4f}")
-        lin_var.set(f"Linear acc : x={la['x']:+.4f}  y={la['y']:+.4f}  z={la['z']:+.4f}")
-        ori_var.set(f"Orientation: x={ori['x']:+.4f}  y={ori['y']:+.4f}  z={ori['z']:+.4f}  w={ori['w']:+.4f}")
-
-        status_var.set("Status: OK")
-        tcp.send_json(data)
-
-    except Exception as e:
-        status_var.set(f"Status: Error - {e}")
-
-    root.after(50, update_ui)
-
-
-def on_close():
-    tcp.stop()
-    root.destroy()
-
-
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.after(100, update_ui)
-root.mainloop()
+            # Maintain ~20 Hz loop rate (approx 50ms)
+            elapsed = time.time() - start_time
+            time.sleep(max(0.005, 0.05 - elapsed))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tcp.stop()
+        print("[imu_speed_node] Stopped", flush=True)

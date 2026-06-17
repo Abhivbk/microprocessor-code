@@ -14,7 +14,7 @@ fn main() {
     });
 
     // Give FSDS time to start
-    thread::sleep(Duration::from_secs(25));
+    thread::sleep(Duration::from_secs(30));
 
     let tx_control = tx.clone();
     let handle_control = thread::spawn(move || {

@@ -2,10 +2,9 @@ import sys
 import os
 import math
 import time
-import tkinter as tk
-from PIL import Image, ImageTk
 import cv2
 import numpy as np
+from scipy.cluster.hierarchy import fclusterdata
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import fsds
@@ -153,37 +152,20 @@ def detect_cones_camera(frame):
     return annotated
 
 
-def euclidean_2d(p1, p2):
-    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
-
-
 def cluster_lidar_points(points_xy, cluster_dist=LIDAR_CLUSTER_DIST):
-    clusters = []
-    used = np.zeros(len(points_xy), dtype=bool)
+    if len(points_xy) == 0:
+        return []
+    if len(points_xy) == 1:
+        return [points_xy]
 
-    for i in range(len(points_xy)):
-        if used[i]:
-            continue
+    pts = np.array(points_xy)
+    labels = fclusterdata(pts, t=cluster_dist, criterion='distance', method='single')
 
-        cluster = [points_xy[i]]
-        used[i] = True
+    clusters = {}
+    for pt, label in zip(points_xy, labels):
+        clusters.setdefault(label, []).append(pt)
 
-        changed = True
-        while changed:
-            changed = False
-            for j in range(len(points_xy)):
-                if used[j]:
-                    continue
-                for cp in cluster:
-                    if euclidean_2d(points_xy[j], cp) < cluster_dist:
-                        cluster.append(points_xy[j])
-                        used[j] = True
-                        changed = True
-                        break
-
-        clusters.append(cluster)
-
-    return clusters
+    return list(clusters.values())
 
 
 def detect_cones_lidar():
@@ -287,45 +269,33 @@ def build_dashboard(cam_panel, lidar_panel):
     return dash
 
 
-root = tk.Tk()
-root.title("Vision Node")
-root.geometry(f"{DASH_W}x{DASH_H}")
-root.configure(bg="black")
+if __name__ == "__main__":
+    print("[vision_node] Running in headless mode")
+    try:
+        while True:
+            start_time = time.time()
 
-image_label = tk.Label(root, bg="black")
-image_label.pack()
+            frame = get_camera_frame()
+            if frame is None:
+                cam_panel = blank_camera_panel()
+            else:
+                cam_panel = detect_cones_camera(frame)
+                cam_panel = cv2.resize(cam_panel, (CAM_W, CAM_H))
 
+            lidar_panel = detect_cones_lidar()
+            dashboard = build_dashboard(cam_panel, lidar_panel)
 
-def update_ui():
-    frame = get_camera_frame()
-    if frame is None:
-        cam_panel = blank_camera_panel()
-    else:
-        cam_panel = detect_cones_camera(frame)
-        cam_panel = cv2.resize(cam_panel, (CAM_W, CAM_H))
+            ok, encoded = cv2.imencode(".jpg", dashboard, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                tcp.send_bytes(encoded.tobytes())
 
-    lidar_panel = detect_cones_lidar()
-    dashboard = build_dashboard(cam_panel, lidar_panel)
+            # Maintain ~30 FPS loop rate (approx 33ms)
+            elapsed = time.time() - start_time
+            sleep_time = max(0.005, 0.033 - elapsed)
+            time.sleep(sleep_time)
 
-    ok, encoded = cv2.imencode(".jpg", dashboard, [cv2.IMWRITE_JPEG_QUALITY, 80])
-    if ok:
-        tcp.send_bytes(encoded.tobytes())
-
-    rgb = cv2.cvtColor(dashboard, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(rgb)
-    tk_img = ImageTk.PhotoImage(image=pil_img)
-
-    image_label.imgtk = tk_img
-    image_label.configure(image=tk_img)
-
-    root.after(33, update_ui)
-
-
-def on_close():
-    tcp.stop()
-    root.destroy()
-
-
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.after(100, update_ui)
-root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tcp.stop()
+        print("[vision_node] Stopped")
