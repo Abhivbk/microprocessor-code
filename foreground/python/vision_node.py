@@ -245,7 +245,7 @@ def detect_cones_lidar():
             cone_count += 1
 
         cv2.putText(panel, f"Lidar cones: {cone_count}", (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, ORANGE, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
         return panel
 
     except Exception:
