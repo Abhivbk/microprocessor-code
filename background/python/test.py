@@ -438,7 +438,8 @@ class TestConsoleApp:
                                 lat_m = (cx - center_x) / scale
                                 fwd_m = (center_y - cy) / scale
                                 dist = math.sqrt(lat_m**2 + fwd_m**2)
-                                lidar_cones.append((cx, cy, dist, lat_m, fwd_m))
+                                if dist <= 15.0:
+                                    lidar_cones.append((cx, cy, dist, lat_m, fwd_m))
 
                         # Cache decoded frames safely
                         with self.yolo_lock:
@@ -476,16 +477,59 @@ class TestConsoleApp:
                     results = self.yolo_model(cam_img, verbose=False)[0]
 
                     # Extract YOLO Camera cones
-                    cam_cones = []
+                    raw_cam_cones = []
                     for box in results.boxes:
                         x1, y1, x2, y2 = box.xyxy[0].tolist()
                         conf = float(box.conf[0])
                         cls_id = int(box.cls[0])
                         label = results.names.get(cls_id, str(cls_id))
+                        
+                        # 1. Low-Confidence Detections Filter
+                        if conf < 0.60:
+                            continue
+                            
+                        # 2. Edge-of-Frame Truncation (Bearing Skew)
+                        CAM_W = 960
+                        # Increased margin to 5px since YOLO boxes don't always perfectly touch the 959th pixel
+                        if x1 <= 5 or x2 >= CAM_W - 5:
+                            continue
+                            
                         bcx = (x1 + x2) / 2
-                        cam_cones.append((bcx, x1, y1, x2, y2, label, conf))
+                        raw_cam_cones.append((bcx, x1, y1, x2, y2, label, conf))
 
-                    # Mathematically sound Spatial Camera-LiDAR Fusion
+                    # 3. Cross-Class Bounding Box Overlap (NMS)
+                    cam_cones = []
+                    # Sort by confidence descending
+                    raw_cam_cones.sort(key=lambda c: c[6], reverse=True)
+                    for new_cone in raw_cam_cones:
+                        _, x1_n, y1_n, x2_n, y2_n, _, _ = new_cone
+                        overlap = False
+                        for kept_cone in cam_cones:
+                            _, x1_k, y1_k, x2_k, y2_k, _, _ = kept_cone
+                            # IoU calculation
+                            xx1 = max(x1_n, x1_k)
+                            yy1 = max(y1_n, y1_k)
+                            xx2 = min(x2_n, x2_k)
+                            yy2 = min(y2_n, y2_k)
+                            w = max(0, xx2 - xx1)
+                            h = max(0, yy2 - yy1)
+                            inter = w * h
+                            area_n = (x2_n - x1_n) * (y2_n - y1_n)
+                            area_k = (x2_k - x1_k) * (y2_k - y1_k)
+                            iou = inter / float(area_n + area_k - inter)
+                            # Decreased IoU threshold to 0.3 to aggressively suppress overlapping 
+                            # boxes of different classes that might have slightly different shapes
+                            if iou > 0.3:  # Overlap threshold
+                                overlap = True
+                                break
+                        if not overlap:
+                            cam_cones.append(new_cone)
+
+                    # Sort cam_cones from bottom-to-top (closest to farthest in 2D image)
+                    cam_cones.sort(key=lambda c: c[4], reverse=True)
+                    # Sort lidar_cones from closest to farthest (3D distance)
+                    lidar_cones.sort(key=lambda l: l[2])
+
                     fused_cones = []
                     used_lidar = set()
 
@@ -495,7 +539,6 @@ class TestConsoleApp:
                         phi_cam = math.atan2(bcx - 480.0, 480.0)
 
                         best_lidar_idx = -1
-                        best_angle_diff = 0.20  # Matches within ~11.5 degrees
 
                         for l_idx, lidar_cone in enumerate(lidar_cones):
                             if l_idx in used_lidar:
@@ -504,9 +547,9 @@ class TestConsoleApp:
                             phi_lidar = math.atan2(lat_m, fwd_m)
 
                             angle_diff = abs(phi_cam - phi_lidar)
-                            if angle_diff < best_angle_diff:
-                                best_angle_diff = angle_diff
+                            if angle_diff < 0.20:  # Matches within ~11.5 degrees
                                 best_lidar_idx = l_idx
+                                break  # Take the first (closest) available LiDAR cone!
 
                         if best_lidar_idx != -1:
                             used_lidar.add(best_lidar_idx)
@@ -517,16 +560,26 @@ class TestConsoleApp:
                                 "cam_box": [int(x1), int(y1), int(x2), int(y2)],
                                 "lidar_pixel": [int(lcx), int(lcy)],
                                 "range": dist,
-                                "bearing": -math.atan2(lat_m, fwd_m),  # CCW positive (Left is positive)
+                                "bearing": -math.atan2(lat_m, fwd_m),  # CCW positive
                                 "color": label
                             })
                         else:
+                            # Fallback: Monocular Depth Estimation
+                            # Z = (f * H) / h, where f=480, H=0.35m (approx cone height), h = y2 - y1
+                            box_h = max(1.0, y2 - y1)
+                            fallback_dist = (480.0 * 0.35) / box_h
+                            
+                            # 4. Sensor Fusion Range Mismatch (Horizon)
+                            # Do not map distant monocular estimations without LiDAR confirmation
+                            if fallback_dist > 12.0:
+                                continue
+                                
                             fused_cones.append({
                                 "label": label,
                                 "conf": conf,
                                 "cam_box": [int(x1), int(y1), int(x2), int(y2)],
                                 "lidar_pixel": None,
-                                "range": None,
+                                "range": fallback_dist,
                                 "bearing": -phi_cam,  # CCW positive
                                 "color": label
                             })
