@@ -1,1 +1,1 @@
-/work/target/debug/autonomouse_code_var: /work/src/main.rs /work/src/pythonspawn.rs
+C:\Users\text2\Desktop\microprocessor-code\microprocessor-code\background\target\debug\autonomouse_code_var.exe: C:\Users\text2\Desktop\microprocessor-code\microprocessor-code\background\src\main.rs C:\Users\text2\Desktop\microprocessor-code\microprocessor-code\background\src\pythonspawn.rs
