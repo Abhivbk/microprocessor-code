@@ -16,6 +16,8 @@ fn main() {
     // Give FSDS time to start
     thread::sleep(Duration::from_secs(30));
 
+
+
     let tx_control = tx.clone();
     let handle_control = thread::spawn(move || {
         runpythonfile_stream(
@@ -49,8 +51,8 @@ fn main() {
         println!("[{tag}] {line}");
     }
 
-    handle_engine.join().expect("engine.py thread panicked");
     handle_control
+
         .join()
         .expect("control_input_node.py thread panicked");
     handle_imu

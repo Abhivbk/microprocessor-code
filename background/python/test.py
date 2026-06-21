@@ -233,83 +233,107 @@ class TestConsoleApp:
                 if os.path.exists(IMU_BIN_PATH):
                     import mmap
                     import struct
-                    with open(IMU_BIN_PATH, "r+b") as f:
-                        if os.fstat(f.fileno()).st_size >= 52:
-                            ram = mmap.mmap(f.fileno(), 52, access=mmap.ACCESS_READ)
-                            t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = struct.unpack("<Q11f", ram[0:52])
-                            self.latest_imu = {
-                                "ground_speed_mps": spd,
-                                "imu": {
-                                    "angular_velocity": {"x": ax, "y": ay, "z": az},
-                                    "linear_acceleration": {"x": lx, "y": ly, "z": lz},
-                                    "orientation": {"x": ox, "y": oy, "z": oz, "w": ow}
+                    try:
+                        with open(IMU_BIN_PATH, "rb") as f:
+                            if os.fstat(f.fileno()).st_size >= 52:
+                                ram = mmap.mmap(f.fileno(), 52, access=mmap.ACCESS_READ)
+                                t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = struct.unpack("<Q11f", ram[0:52])
+                                self.latest_imu = {
+                                    "ground_speed_mps": spd,
+                                    "imu": {
+                                        "angular_velocity": {"x": ax, "y": ay, "z": az},
+                                        "linear_acceleration": {"x": lx, "y": ly, "z": lz},
+                                        "orientation": {"x": ox, "y": oy, "z": oz, "w": ow}
+                                    }
                                 }
-                            }
-                            self.imu_status = "Reading SHM (mmap)"
-                            ram.close()
+                                self.imu_status = "Reading SHM (mmap)"
+                                ram.close()
+                    except Exception:
+                        pass
                     
                 if os.path.exists(ACT_BIN_PATH):
                     import mmap
                     import struct
-                    with open(ACT_BIN_PATH, "r+b") as f:
-                        if os.fstat(f.fileno()).st_size >= 20:
-                            ram = mmap.mmap(f.fileno(), 20, access=mmap.ACCESS_READ)
-                            t, th, br, st = struct.unpack("<Qfff", ram[0:20])
-                            self.latest_actuator = {"throttle": th, "brake": br, "steering": st}
-                            self.act_status = "Reading SHM (mmap)"
-                            ram.close()
+                    try:
+                        with open(ACT_BIN_PATH, "rb") as f:
+                            if os.fstat(f.fileno()).st_size >= 20:
+                                ram = mmap.mmap(f.fileno(), 20, access=mmap.ACCESS_READ)
+                                t, th, br, st = struct.unpack("<Qfff", ram[0:20])
+                                self.latest_actuator = {"throttle": th, "brake": br, "steering": st}
+                                self.act_status = "Reading SHM (mmap)"
+                                ram.close()
+                    except Exception:
+                        pass
 
                 if os.path.exists(CAM_BIN_PATH):
-                    raw = np.fromfile(CAM_BIN_PATH, dtype=np.uint8)
-                    if len(raw) == CAM_W * CAM_H * 3:
-                        cam_img = raw.reshape((CAM_H, CAM_W, 3))
-                        self.vision_status = "Reading SHM"
-                        with self.yolo_lock:
-                            self.latest_cam_img = cam_img
+                    import mmap
+                    import struct
+                    try:
+                        with open(CAM_BIN_PATH, "rb") as f:
+                            file_size = os.fstat(f.fileno()).st_size
+                            if file_size > 32:
+                                ram = mmap.mmap(f.fileno(), file_size, access=mmap.ACCESS_READ)
+                                height, width, channels, dtype_code = struct.unpack("QQQQ", ram[0:32])
+                                img_size = int(height) * int(width) * int(channels)
+                                if file_size >= 32 + img_size and img_size > 0:
+                                    raw_bytes = bytes(ram[32:32 + img_size])
+                                    cam_img = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((int(height), int(width), int(channels)))
+                                    self.vision_status = "Reading SHM (mmap)"
+                                    with self.yolo_lock:
+                                        self.latest_cam_img = cam_img.copy()
+                                ram.close()
+                    except Exception:
+                        pass
 
                 if os.path.exists(CAM_CONES_PATH):
                     import mmap
                     import struct
-                    with open(CAM_CONES_PATH, "r+b") as f:
-                        fs = os.fstat(f.fileno()).st_size
-                        if fs >= 8:
-                            ram = mmap.mmap(f.fileno(), fs, access=mmap.ACCESS_READ)
-                            num_cones = struct.unpack("Q", ram[0:8])[0]
-                            if fs >= 8 + num_cones * 24:
-                                with self.yolo_lock:
-                                    self.latest_cam_cones = []
-                                    offset = 8
-                                    labels = {0: "yellow_cone", 1: "blue_cone", 2: "orange_cone"}
-                                    for _ in range(num_cones):
-                                        x1, y1, x2, y2, conf, lid = struct.unpack("fffffi", ram[offset:offset+24])
-                                        offset += 24
-                                        bcx = (x1 + x2) / 2
-                                        lbl = labels.get(lid, "unknown")
-                                        self.latest_cam_cones.append((bcx, x1, y1, x2, y2, lbl, conf))
-                            ram.close()
+                    try:
+                        with open(CAM_CONES_PATH, "rb") as f:
+                            fs = os.fstat(f.fileno()).st_size
+                            if fs >= 8:
+                                ram = mmap.mmap(f.fileno(), fs, access=mmap.ACCESS_READ)
+                                num_cones = struct.unpack("Q", ram[0:8])[0]
+                                if fs >= 8 + num_cones * 24:
+                                    with self.yolo_lock:
+                                        self.latest_cam_cones = []
+                                        offset = 8
+                                        labels = {0: "yellow_cone", 1: "blue_cone", 2: "orange_cone"}
+                                        for _ in range(num_cones):
+                                            x1, y1, x2, y2, conf, lid = struct.unpack("fffffi", ram[offset:offset+24])
+                                            offset += 24
+                                            bcx = (x1 + x2) / 2
+                                            lbl = labels.get(lid, "unknown")
+                                            self.latest_cam_cones.append((bcx, x1, y1, x2, y2, lbl, conf))
+                                ram.close()
+                    except Exception:
+                        pass
 
                 if os.path.exists(LIDAR_BIN_PATH):
                     import mmap
                     import struct
-                    with open(LIDAR_BIN_PATH, "r+b") as f:
-                        file_size = os.fstat(f.fileno()).st_size
-                        if file_size >= 8:
-                            ram = mmap.mmap(f.fileno(), file_size, access=mmap.ACCESS_READ)
-                            num_points = struct.unpack("Q", ram[0:8])[0]
-                            if file_size >= 8 + num_points * 16:
-                                with self.yolo_lock:
-                                    self.latest_lidar_cones = []
-                                    offset = 8
-                                    for _ in range(num_points):
-                                        x = struct.unpack("d", ram[offset:offset+8])[0]
-                                        offset += 8
-                                        y = struct.unpack("d", ram[offset:offset+8])[0]
-                                        offset += 8
-                                        dist = math.sqrt(x*x + y*y)
-                                        px = int(350 + y * 23.0)
-                                        py = int(500 - x * 23.0)
-                                        self.latest_lidar_cones.append((px, py, dist, y, x))
-                            ram.close()
+                    try:
+                        with open(LIDAR_BIN_PATH, "rb") as f:
+                            file_size = os.fstat(f.fileno()).st_size
+                            if file_size >= 8:
+                                ram = mmap.mmap(f.fileno(), file_size, access=mmap.ACCESS_READ)
+                                num_points = struct.unpack("Q", ram[0:8])[0]
+                                if file_size >= 8 + num_points * 16:
+                                    with self.yolo_lock:
+                                        self.latest_lidar_cones = []
+                                        offset = 8
+                                        for _ in range(num_points):
+                                            x = struct.unpack("d", ram[offset:offset+8])[0]
+                                            offset += 8
+                                            y = struct.unpack("d", ram[offset:offset+8])[0]
+                                            offset += 8
+                                            dist = math.sqrt(x*x + y*y)
+                                            px = int(350 + y * 23.0)
+                                            py = int(500 - x * 23.0)
+                                            self.latest_lidar_cones.append((px, py, dist, y, x))
+                                ram.close()
+                    except Exception:
+                        pass
 
             except Exception as e:
                 pass
@@ -370,7 +394,9 @@ class TestConsoleApp:
                         "lidar_pixel": [int(lcx), int(lcy)], "range": dist, "bearing": -math.atan2(lat_m, fwd_m), "color": label
                     })
                 else:
-                    box_h = max(1.0, y2 - y1)
+                    box_h = float(y2 - y1)
+                    if box_h < 1.0:
+                        continue
                     fallback_dist = (480.0 * 0.35) / box_h
                     if fallback_dist > 12.0:
                         continue
