@@ -56,6 +56,12 @@ class TestConsoleApp:
 
         self.ekf = EKFSLAM()
         self.last_prediction_time = time.time()
+
+        # Build the initial stationary view once. Two EKF observations are
+        # required because new landmarks are provisional on their first sighting.
+        self.starting_view_mapped = False
+        self.starting_view_update_count = 0
+        self.starting_view_required_updates = 2
         
         self.yolo_lock = threading.Lock()
 
@@ -239,6 +245,7 @@ class TestConsoleApp:
                                 ram = mmap.mmap(f.fileno(), 52, access=mmap.ACCESS_READ)
                                 t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = struct.unpack("<Q11f", ram[0:52])
                                 self.latest_imu = {
+                                    "timestamp_ms": t,
                                     "ground_speed_mps": spd,
                                     "imu": {
                                         "angular_velocity": {"x": ax, "y": ay, "z": az},
@@ -416,17 +423,33 @@ class TestConsoleApp:
         dt = now_time - self.last_prediction_time
         self.last_prediction_time = now_time
 
-        speed, yaw_rate, qz, qw = 0.0, 0.0, 0.0, 1.0
+        speed, yaw_rate = 0.0, 0.0
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 0.0
+        imu_timestamp_ms = 0
         if self.latest_imu:
+            imu_timestamp_ms = self.latest_imu.get("timestamp_ms", 0)
             speed = self.latest_imu.get("ground_speed_mps", 0.0)
             yaw_rate = self.latest_imu.get("imu", {}).get("angular_velocity", {}).get("z", 0.0)
             ori = self.latest_imu.get("imu", {}).get("orientation", {})
+            qx = ori.get("x", 0.0)
+            qy = ori.get("y", 0.0)
             qz = ori.get("z", 0.0)
-            qw = ori.get("w", 1.0)
+            qw = ori.get("w", 0.0)
 
         self.ekf.predict(speed, yaw_rate, dt)
-        if qz != 0.0 or qw != 1.0:
-            abs_theta = self.ekf.normalize_angle(2.0 * math.atan2(qz, qw))
+
+        # A quaternion of (0, 0, 0, 1) is a valid zero-degree heading, not
+        # missing IMU data. Use packet validity and quaternion norm instead of
+        # rejecting that value, and calculate yaw from the full quaternion.
+        quaternion_norm = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if imu_timestamp_ms > 0 and quaternion_norm > 1e-6:
+            qx /= quaternion_norm
+            qy /= quaternion_norm
+            qz /= quaternion_norm
+            qw /= quaternion_norm
+            sin_yaw = 2.0 * (qw * qz + qx * qy)
+            cos_yaw = 1.0 - 2.0 * (qy * qy + qz * qz)
+            abs_theta = self.ekf.normalize_angle(math.atan2(sin_yaw, cos_yaw))
             if not hasattr(self.ekf, 'heading_initialized'):
                 self.ekf.x[2] = abs_theta
                 self.ekf.heading_initialized = True
@@ -436,8 +459,19 @@ class TestConsoleApp:
         with self.yolo_lock:
             fused = list(self.latest_fused_measurements)
 
-        if fused and speed > 0.1 and hasattr(self.ekf, 'heading_initialized'):
-            self.ekf.update(fused)
+        if fused and hasattr(self.ekf, 'heading_initialized'):
+            if speed > 0.1:
+                # Once the car moves, normal continuous mapping takes over and
+                # no later stop should be mistaken for the initial view.
+                self.starting_view_mapped = True
+                self.ekf.update(fused)
+            elif not self.starting_view_mapped:
+                # Confirm the cones visible at the starting position, then stop
+                # repeatedly feeding the same stationary observations to EKF.
+                self.ekf.update(fused)
+                self.starting_view_update_count += 1
+                if self.starting_view_update_count >= self.starting_view_required_updates:
+                    self.starting_view_mapped = True
 
         self.throttle_label.set(f"Throttle: {self.desired['throttle']:.3f}")
         self.brake_label.set(f"Brake: {self.desired['brake']:.3f}")
