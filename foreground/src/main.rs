@@ -45,6 +45,15 @@ fn main() {
         );
     });
 
+    let tx_actuator = tx.clone();
+    let handle_actuator = thread::spawn(move || {
+        runpythonfile_stream(
+            "python/actuator_state_node.py",
+            "actuator_state_node.py",
+            tx_actuator,
+        );
+    });
+
     drop(tx);
 
     while let Ok((tag, line)) = rx.recv() {
@@ -61,4 +70,7 @@ fn main() {
     handle_vision
         .join()
         .expect("vision_node.py thread panicked");
+    handle_actuator
+        .join()
+        .expect("actuator_state_node.py thread panicked");
 }

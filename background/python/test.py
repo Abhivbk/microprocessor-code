@@ -10,6 +10,10 @@ import numpy as np
 import cv2
 import math
 from ekf_slam import EKFSLAM
+from autonomy.path_planner import DelaunayPathPlanner, PlannerResult
+from autonomy.pid_controller import AutonomousPIDController, ControlProposal
+from autonomy import config as autonomy_config
+from autonomy.lap_tracker import LapStatus, LapTracker
 
 SHARED_MEM_DIR_FG = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sharedmemory", "forground"))
 SHARED_MEM_DIR_BG = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sharedmemory", "background"))
@@ -35,7 +39,9 @@ class TestConsoleApp:
         self.root.configure(bg="#101010")
 
         self.latest_imu = None
+        self.imu_feedback_fresh = False
         self.latest_actuator = None
+        self.actuator_feedback_fresh = False
         self.latest_cam_img = None
         self.latest_lidar_img = None
         
@@ -48,14 +54,46 @@ class TestConsoleApp:
         self.vision_status = "Waiting for SHM"
         self.ctrl_status = "Writing to SHM"
 
-        self.desired = {
+        self.manual_desired = {
             "throttle": 0.0,
-            "brake": 0.0,
+            "brake": 1.0,
             "steering": 0.0,
         }
+        self.desired = dict(self.manual_desired)
+        self.desired_timestamp_ms = int(time.time() * 1000)
+        self.control_lock = threading.Lock()
+        self.autonomy_enabled = False
 
         self.ekf = EKFSLAM()
         self.last_prediction_time = time.time()
+
+        # Build the initial stationary view once. Two EKF observations are
+        # required because new landmarks are provisional on their first sighting.
+        self.starting_view_mapped = False
+        self.starting_view_update_count = 0
+        self.starting_view_required_updates = autonomy_config.STARTING_VIEW_REQUIRED_UPDATES
+
+        # First-lap path planning; completed-lap racing plans are generated once.
+        self.path_planner = DelaunayPathPlanner()
+        self.latest_plan_result = PlannerResult.invalid("Waiting for EKF landmarks")
+        self.triangle_result = []
+        self.raw_centerline_result = []
+        self.smooth_centerline_result = []
+        self.racing_line_result = []
+        self.path_is_valid = False
+        self.path_is_closed = False
+        self.last_path_plan_time = 0.0
+        self.path_plan_interval = autonomy_config.PATH_PLAN_INTERVAL_SECONDS
+
+        # Proposals remain dry-run in manual mode and become the selected output
+        # only after the guarded autonomous mode is explicitly enabled.
+        self.pid_controller = AutonomousPIDController()
+        self.proposed_control = ControlProposal.safe_stop("Waiting for controller inputs")
+        self.lap_tracker = LapTracker()
+        self.lap_status = LapStatus(False, False, False, 0.0, 0.0, "Not started")
+        self.completed_lap_plan = None
+        self.completed_lap_plan_building = False
+        self.plan_lock = threading.Lock()
         
         self.yolo_lock = threading.Lock()
 
@@ -88,6 +126,7 @@ class TestConsoleApp:
         col2.pack(side="left", fill="both", expand=False, padx=5)
 
         self._build_controls_panel(col1)
+        self._build_pid_panel(col1)
         self._build_slam_panel(col1)
         self._build_status_panel(col2)
         self._build_imu_panel(col2)
@@ -107,7 +146,7 @@ class TestConsoleApp:
     def _build_controls_panel(self, parent):
         frame = self._make_section(parent, "Control Output -> SHM")
         self.throttle_var = tk.DoubleVar(value=0.0)
-        self.brake_var = tk.DoubleVar(value=0.0)
+        self.brake_var = tk.DoubleVar(value=1.0)
         self.steering_var = tk.DoubleVar(value=0.0)
 
         self.throttle_label = tk.StringVar(value="Throttle: 0.000")
@@ -127,8 +166,37 @@ class TestConsoleApp:
         tk.Button(button_row, text="Zero Throttle", command=self.zero_throttle, width=15).pack(side="left", padx=4)
         tk.Button(button_row, text="Full Brake", command=self.full_brake, width=15).pack(side="left", padx=4)
 
+        self.autonomy_mode_var = tk.StringVar(value="Mode: MANUAL")
+        self.autonomy_button = tk.Button(
+            frame,
+            text="Enable Autonomous",
+            command=self.toggle_autonomy,
+            width=22,
+        )
+        self.autonomy_button.pack(pady=(0, 6))
+        tk.Label(
+            frame,
+            textvariable=self.autonomy_mode_var,
+            fg="#00ffff",
+            bg="#181818",
+            font=("Arial", 10, "bold"),
+        ).pack(pady=(0, 8))
+
         guide_text = "Keyboard Driving Controls (Focus this window):\n  - Throttle: W / Up Arrow\n  - Steering: A/D or Left/Right\n  - Brake: S / Down Arrow"
         tk.Label(frame, text=guide_text, fg="#aaaaaa", bg="#181818", font=("Arial", 9), justify="left", anchor="w").pack(fill="x", padx=12, pady=(0, 8))
+
+    def _build_pid_panel(self, parent):
+        frame = self._make_section(parent, "PID Proposal / Autonomous Output")
+        self.pid_proposal_var = tk.StringVar(value="Waiting for controller inputs")
+        tk.Label(
+            frame,
+            textvariable=self.pid_proposal_var,
+            fg="#7CFC00",
+            bg="#181818",
+            font=("Consolas", 9),
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=8)
 
     def _build_status_panel(self, parent):
         frame = self._make_section(parent, "SHM Status")
@@ -166,9 +234,11 @@ class TestConsoleApp:
         self.image_label.pack(fill="both", expand=True, padx=10, pady=10)
 
     def on_slider_change(self, _=None):
-        self.desired["throttle"] = round(float(self.throttle_var.get()), 3)
-        self.desired["brake"] = round(float(self.brake_var.get()), 3)
-        self.desired["steering"] = round(float(self.steering_var.get()), 3)
+        self.manual_desired["throttle"] = round(float(self.throttle_var.get()), 3)
+        self.manual_desired["brake"] = round(float(self.brake_var.get()), 3)
+        self.manual_desired["steering"] = round(float(self.steering_var.get()), 3)
+        if not self.autonomy_enabled:
+            self._set_desired(self.manual_desired)
 
     def center_steering(self):
         self.steering_var.set(0.0)
@@ -179,9 +249,62 @@ class TestConsoleApp:
         self.on_slider_change()
 
     def full_brake(self):
+        if self.autonomy_enabled:
+            self._disable_autonomy("Manual emergency brake")
         self.brake_var.set(1.0)
         self.throttle_var.set(0.0)
         self.on_slider_change()
+
+    def toggle_autonomy(self):
+        if self.autonomy_enabled:
+            self._disable_autonomy("Switched to manual")
+            return
+
+        if not autonomy_config.STEERING_SIGN_VERIFIED:
+            self.autonomy_mode_var.set(
+                "AUTO BLOCKED: set STEERING_SIGN_VERIFIED in autonomy/config.py"
+            )
+            self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
+            return
+
+        self.autonomy_enabled = True
+        self.pid_controller.reset()
+        self.lap_tracker.reset((self.ekf.x[0], self.ekf.x[1], self.ekf.x[2]))
+        self.lap_status = LapStatus(
+            lap_complete=False,
+            just_completed=False,
+            departed_start=False,
+            distance_travelled=0.0,
+            distance_from_start=0.0,
+            reason="Autonomous lap started",
+        )
+        with self.plan_lock:
+            self.completed_lap_plan = None
+            self.completed_lap_plan_building = False
+        self.autonomy_button.configure(text="Disable Autonomous")
+        self.autonomy_mode_var.set("Mode: AUTONOMOUS")
+        self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
+
+    def _disable_autonomy(self, reason):
+        self.autonomy_enabled = False
+        self.pid_controller.reset()
+        self.manual_desired = {"throttle": 0.0, "brake": 1.0, "steering": 0.0}
+        self.throttle_var.set(0.0)
+        self.brake_var.set(1.0)
+        self.steering_var.set(0.0)
+        self.autonomy_button.configure(text="Enable Autonomous")
+        self.autonomy_mode_var.set(f"Mode: MANUAL ({reason})")
+        self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
+
+    def _set_desired(self, command):
+        safe_command = {
+            "throttle": max(0.0, min(1.0, float(command.get("throttle", 0.0)))),
+            "brake": max(0.0, min(1.0, float(command.get("brake", 1.0)))),
+            "steering": max(-1.0, min(1.0, float(command.get("steering", 0.0)))),
+        }
+        with self.control_lock:
+            self.desired = safe_command
+            self.desired_timestamp_ms = int(time.time() * 1000)
 
     def _on_key_press(self, event):
         self.pressed_keys[event.keysym] = True
@@ -191,12 +314,12 @@ class TestConsoleApp:
         self.pressed_keys[event.keysym] = False
 
     def _update_keyboard_inputs(self):
-        if not self.using_keyboard:
+        if not self.using_keyboard or self.autonomy_enabled:
             return
 
-        throttle = self.desired["throttle"]
-        brake = self.desired["brake"]
-        steering = self.desired["steering"]
+        throttle = self.manual_desired["throttle"]
+        brake = self.manual_desired["brake"]
+        steering = self.manual_desired["steering"]
 
         if self.pressed_keys.get("w") or self.pressed_keys.get("Up"):
             throttle = min(0.40, throttle + 0.05)
@@ -239,6 +362,7 @@ class TestConsoleApp:
                                 ram = mmap.mmap(f.fileno(), 52, access=mmap.ACCESS_READ)
                                 t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = struct.unpack("<Q11f", ram[0:52])
                                 self.latest_imu = {
+                                    "timestamp_ms": t,
                                     "ground_speed_mps": spd,
                                     "imu": {
                                         "angular_velocity": {"x": ax, "y": ay, "z": az},
@@ -259,8 +383,24 @@ class TestConsoleApp:
                             if os.fstat(f.fileno()).st_size >= 20:
                                 ram = mmap.mmap(f.fileno(), 20, access=mmap.ACCESS_READ)
                                 t, th, br, st = struct.unpack("<Qfff", ram[0:20])
-                                self.latest_actuator = {"throttle": th, "brake": br, "steering": st}
-                                self.act_status = "Reading SHM (mmap)"
+                                feedback_age_ms = int(time.time() * 1000) - t if t > 0 else None
+                                self.actuator_feedback_fresh = (
+                                    feedback_age_ms is not None
+                                    and 0 <= feedback_age_ms <= autonomy_config.ACTUATOR_STALE_MS
+                                )
+                                self.latest_actuator = {
+                                    "timestamp_ms": t,
+                                    "throttle": th,
+                                    "brake": br,
+                                    "steering": st,
+                                    "fresh": self.actuator_feedback_fresh,
+                                }
+                                if self.actuator_feedback_fresh:
+                                    self.act_status = "Fresh feedback (mmap)"
+                                elif feedback_age_ms is None:
+                                    self.act_status = "Waiting for feedback"
+                                else:
+                                    self.act_status = f"Stale feedback ({feedback_age_ms} ms)"
                                 ram.close()
                     except Exception:
                         pass
@@ -354,7 +494,16 @@ class TestConsoleApp:
         with open(CONTROLS_PATH, "r+b") as f:
             ram = mmap.mmap(f.fileno(), STRUCT_SIZE)
             while True:
-                packed = struct.pack(BINARY_FORMAT, int(time.time()*1000), self.desired["throttle"], self.desired["brake"], self.desired["steering"])
+                with self.control_lock:
+                    command = dict(self.desired)
+                    command_timestamp_ms = self.desired_timestamp_ms
+                packed = struct.pack(
+                    BINARY_FORMAT,
+                    command_timestamp_ms,
+                    command["throttle"],
+                    command["brake"],
+                    command["steering"],
+                )
                 ram[0:STRUCT_SIZE] = packed
                 self.ctrl_status = "Writing (mmap)"
                 time.sleep(0.05)
@@ -409,24 +558,138 @@ class TestConsoleApp:
                 self.latest_fused_measurements = fused_cones
             time.sleep(0.05)
 
+    def _refresh_feedback_freshness(self, now_ms):
+        imu_timestamp = int(self.latest_imu.get("timestamp_ms", 0)) if self.latest_imu else 0
+        imu_age_ms = now_ms - imu_timestamp if imu_timestamp > 0 else None
+        self.imu_feedback_fresh = (
+            imu_age_ms is not None
+            and 0 <= imu_age_ms <= autonomy_config.IMU_STALE_MS
+        )
+
+        actuator_timestamp = (
+            int(self.latest_actuator.get("timestamp_ms", 0))
+            if self.latest_actuator
+            else 0
+        )
+        actuator_age_ms = now_ms - actuator_timestamp if actuator_timestamp > 0 else None
+        self.actuator_feedback_fresh = (
+            actuator_age_ms is not None
+            and 0 <= actuator_age_ms <= autonomy_config.ACTUATOR_STALE_MS
+        )
+        if self.latest_actuator:
+            self.latest_actuator["fresh"] = self.actuator_feedback_fresh
+            if self.actuator_feedback_fresh:
+                self.act_status = "Fresh feedback (mmap)"
+            elif actuator_age_ms is None:
+                self.act_status = "Waiting for feedback"
+            else:
+                self.act_status = f"Stale feedback ({actuator_age_ms} ms)"
+
+    def _update_path_plan(self, now_time):
+        if now_time - self.last_path_plan_time < self.path_plan_interval:
+            return
+        self.last_path_plan_time = now_time
+
+        with self.plan_lock:
+            completed_plan = self.completed_lap_plan
+        if completed_plan is not None:
+            self._apply_plan_result(completed_plan)
+            return
+
+        landmarks = self._collect_ekf_landmarks()
+        result = self.path_planner.update(
+            car_pose=(self.ekf.x[0], self.ekf.x[1], self.ekf.x[2]),
+            ekf_landmarks=landmarks,
+        )
+        self._apply_plan_result(result)
+
+    def _collect_ekf_landmarks(self):
+        landmarks = []
+        for order, landmark in enumerate(self.ekf.landmarks):
+            idx = int(landmark.get("id", order))
+            x_idx = 3 + 2 * idx
+            y_idx = 4 + 2 * idx
+            if y_idx >= len(self.ekf.x):
+                continue
+            landmarks.append({
+                "x": float(self.ekf.x[x_idx]),
+                "y": float(self.ekf.x[y_idx]),
+                "color": landmark.get("color", ""),
+                "hit_count": int(landmark.get("hit_count", 0)),
+            })
+        return landmarks
+
+    def _apply_plan_result(self, result):
+        self.latest_plan_result = result
+        self.triangle_result = result.triangles
+        self.raw_centerline_result = result.raw_centerline
+        self.smooth_centerline_result = result.smoothed_centerline
+        self.racing_line_result = result.racing_line
+        self.path_is_valid = result.is_valid
+        self.path_is_closed = result.is_closed
+
+    def _start_completed_lap_plan(self):
+        with self.plan_lock:
+            if self.completed_lap_plan_building or self.completed_lap_plan is not None:
+                return
+            self.completed_lap_plan_building = True
+
+        pose_snapshot = (
+            float(self.ekf.x[0]),
+            float(self.ekf.x[1]),
+            float(self.ekf.x[2]),
+        )
+        landmark_snapshot = self._collect_ekf_landmarks()
+
+        def build_plan():
+            planner = DelaunayPathPlanner()
+            result = planner.update(
+                car_pose=pose_snapshot,
+                ekf_landmarks=landmark_snapshot,
+                completed_lap=True,
+            )
+            with self.plan_lock:
+                self.completed_lap_plan = result
+                self.completed_lap_plan_building = False
+
+        threading.Thread(target=build_plan, daemon=True).start()
+
     def refresh_ui(self):
         self._update_keyboard_inputs()
 
         now_time = time.time()
+        now_ms = int(now_time * 1000)
         dt = now_time - self.last_prediction_time
         self.last_prediction_time = now_time
+        self._refresh_feedback_freshness(now_ms)
 
-        speed, yaw_rate, qz, qw = 0.0, 0.0, 0.0, 1.0
+        speed, yaw_rate = 0.0, 0.0
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 0.0
+        imu_timestamp_ms = 0
         if self.latest_imu:
+            imu_timestamp_ms = self.latest_imu.get("timestamp_ms", 0)
             speed = self.latest_imu.get("ground_speed_mps", 0.0)
             yaw_rate = self.latest_imu.get("imu", {}).get("angular_velocity", {}).get("z", 0.0)
             ori = self.latest_imu.get("imu", {}).get("orientation", {})
+            qx = ori.get("x", 0.0)
+            qy = ori.get("y", 0.0)
             qz = ori.get("z", 0.0)
-            qw = ori.get("w", 1.0)
+            qw = ori.get("w", 0.0)
 
         self.ekf.predict(speed, yaw_rate, dt)
-        if qz != 0.0 or qw != 1.0:
-            abs_theta = self.ekf.normalize_angle(2.0 * math.atan2(qz, qw))
+
+        # A quaternion of (0, 0, 0, 1) is a valid zero-degree heading, not
+        # missing IMU data. Use packet validity and quaternion norm instead of
+        # rejecting that value, and calculate yaw from the full quaternion.
+        quaternion_norm = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if imu_timestamp_ms > 0 and quaternion_norm > 1e-6:
+            qx /= quaternion_norm
+            qy /= quaternion_norm
+            qz /= quaternion_norm
+            qw /= quaternion_norm
+            sin_yaw = 2.0 * (qw * qz + qx * qy)
+            cos_yaw = 1.0 - 2.0 * (qy * qy + qz * qz)
+            abs_theta = self.ekf.normalize_angle(math.atan2(sin_yaw, cos_yaw))
             if not hasattr(self.ekf, 'heading_initialized'):
                 self.ekf.x[2] = abs_theta
                 self.ekf.heading_initialized = True
@@ -436,8 +699,110 @@ class TestConsoleApp:
         with self.yolo_lock:
             fused = list(self.latest_fused_measurements)
 
-        if fused and speed > 0.1 and hasattr(self.ekf, 'heading_initialized'):
-            self.ekf.update(fused)
+        if fused and hasattr(self.ekf, 'heading_initialized'):
+            if speed > 0.1:
+                # Once the car moves, normal continuous mapping takes over and
+                # no later stop should be mistaken for the initial view.
+                self.starting_view_mapped = True
+                self.ekf.update(fused)
+            elif not self.starting_view_mapped:
+                # Confirm the cones visible at the starting position, then stop
+                # repeatedly feeding the same stationary observations to EKF.
+                self.ekf.update(fused)
+                self.starting_view_update_count += 1
+                if self.starting_view_update_count >= self.starting_view_required_updates:
+                    self.starting_view_mapped = True
+
+        self._update_path_plan(now_time)
+
+        if (
+            self.autonomy_enabled
+            and self.imu_feedback_fresh
+            and hasattr(self.ekf, "heading_initialized")
+        ):
+            self.lap_status = self.lap_tracker.update(
+                (self.ekf.x[0], self.ekf.x[1], self.ekf.x[2])
+            )
+            if self.lap_status.just_completed:
+                self._start_completed_lap_plan()
+
+        controller_centerline = (
+            self.racing_line_result
+            if self.lap_status.lap_complete and self.racing_line_result
+            else self.smooth_centerline_result
+        )
+
+        applied_steering = (
+            float(self.latest_actuator.get("steering", 0.0))
+            if self.latest_actuator
+            else 0.0
+        )
+        self.proposed_control = self.pid_controller.compute(
+            car_pose=(self.ekf.x[0], self.ekf.x[1], self.ekf.x[2]),
+            current_speed=speed,
+            applied_steering=applied_steering,
+            centerline=controller_centerline,
+            dt=dt,
+            path_is_valid=self.path_is_valid,
+            imu_is_fresh=self.imu_feedback_fresh,
+            actuator_is_fresh=self.actuator_feedback_fresh,
+            path_is_closed=(
+                self.path_is_closed
+                and bool(self.racing_line_result)
+                and controller_centerline is self.racing_line_result
+            ),
+        )
+
+        proposal = self.proposed_control
+        if proposal.valid:
+            target_x, target_y = proposal.target_point
+            proposal_mode = "ACTIVE AUTONOMOUS" if self.autonomy_enabled else "VALID DRY RUN"
+            self.pid_proposal_var.set(
+                f"{proposal_mode}\n"
+                f"T={proposal.throttle:.3f}  B={proposal.brake:.3f}  S={proposal.steering:+.3f}\n"
+                f"target=({target_x:.2f}, {target_y:.2f})  Ld={proposal.lookahead_distance:.2f}m\n"
+                f"heading error={math.degrees(proposal.heading_error):+.2f}°  "
+                f"speed error={proposal.speed_error:+.2f}m/s"
+            )
+        else:
+            stop_mode = "ACTIVE SAFE STOP" if self.autonomy_enabled else "DRY-RUN SAFE STOP"
+            self.pid_proposal_var.set(
+                f"{stop_mode}\n"
+                f"T=0.000  B=1.000  S=0.000\n{proposal.reason}"
+            )
+
+        if self.autonomy_enabled:
+            proposal_age_ms = now_ms - proposal.timestamp_ms
+            proposal_is_fresh = (
+                0 <= proposal_age_ms <= autonomy_config.CONTROL_SOURCE_STALE_MS
+            )
+            if proposal.valid and proposal_is_fresh:
+                self._set_desired({
+                    "throttle": proposal.throttle,
+                    "brake": proposal.brake,
+                    "steering": proposal.steering,
+                })
+            else:
+                self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
+        else:
+            # A healthy UI loop supplies the manual command heartbeat. If this
+            # loop stops, the foreground watchdog sees the old timestamp.
+            self._set_desired(self.manual_desired)
+
+        if self.autonomy_enabled:
+            with self.plan_lock:
+                racing_building = self.completed_lap_plan_building
+            if racing_building:
+                phase = "BUILDING RACING LINE"
+            elif self.racing_line_result:
+                phase = "RACING LINE"
+            else:
+                phase = "FIRST-LAP CENTERLINE"
+            safety = "RUNNING" if proposal.valid else f"SAFE STOP: {proposal.reason}"
+            self.autonomy_mode_var.set(
+                f"Mode: AUTONOMOUS | {phase} | {safety} | "
+                f"lap distance={self.lap_status.distance_travelled:.1f}m"
+            )
 
         self.throttle_label.set(f"Throttle: {self.desired['throttle']:.3f}")
         self.brake_label.set(f"Brake: {self.desired['brake']:.3f}")
@@ -460,6 +825,7 @@ class TestConsoleApp:
             self.ori_var.set(f"Orientation: x={ori.get('x', 0.0):+.4f}  y={ori.get('y', 0.0):+.4f}  z={ori.get('z', 0.0):+.4f}  w={ori.get('w', 1.0):+.4f}")
 
         if self.latest_actuator:
+            self.act_status_var.set(f"Actuator: {self.act_status}")
             self.act_throttle_var.set(f"Throttle: {float(self.latest_actuator.get('throttle', 0.0)):.3f}")
             self.act_brake_var.set(f"Brake: {float(self.latest_actuator.get('brake', 0.0)):.3f}")
             self.act_steering_var.set(f"Steering: {float(self.latest_actuator.get('steering', 0.0)):.3f}")
@@ -541,8 +907,18 @@ class TestConsoleApp:
             self.image_label.configure(image=tk_img)
             self.image_label.image = tk_img
 
+        plan_status = (
+            f"Path: {'VALID' if self.path_is_valid else 'WAIT'}  "
+            f"tri={len(self.triangle_result)}  "
+            f"raw={len(self.raw_centerline_result)}  "
+            f"smooth={len(self.smooth_centerline_result)}  "
+            f"race={len(self.racing_line_result)}  "
+            f"closed={'yes' if self.path_is_closed else 'no'}"
+        )
         if fused:
-            lines = []
+            lines = [plan_status]
+            if not self.path_is_valid and self.latest_plan_result.reason:
+                lines.append(self.latest_plan_result.reason)
             for cone in fused[:5]:
                 r_val = f"{cone['range']:.2f}m" if cone['range'] is not None else "---"
                 b_deg = math.degrees(cone['bearing'])
@@ -550,7 +926,8 @@ class TestConsoleApp:
             if len(fused) > 5: lines.append(f"... and {len(fused) - 5} more")
             self.slam_text_var.set("\n".join(lines))
         else:
-            self.slam_text_var.set("No detections")
+            reason = self.latest_plan_result.reason or "No detections"
+            self.slam_text_var.set(f"{plan_status}\n{reason}")
 
         self.root.after(50, self.refresh_ui)
 
@@ -572,6 +949,57 @@ class TestConsoleApp:
         for y_line in np.arange(start_y, end_y + grid_spacing, grid_spacing):
             px = int(cx + (y_line - yv) * scale)
             cv2.line(map_img, (px, 0), (px, 540), (40, 40, 40), 1)
+
+        def world_to_map(point):
+            world_x, world_y = point
+            return (
+                int(cx + (world_y - yv) * scale),
+                int(cy - (world_x - xv) * scale),
+            )
+
+        # Delaunay result: thin grey triangle outlines.
+        for triangle in self.triangle_result:
+            triangle_pixels = np.array(
+                [world_to_map(point) for point in triangle.points],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            cv2.polylines(map_img, [triangle_pixels], True, (75, 75, 75), 1)
+
+        # Raw midpoint centerline: red points and segments.
+        if len(self.raw_centerline_result) >= 2:
+            raw_pixels = np.array(
+                [world_to_map(point) for point in self.raw_centerline_result],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            cv2.polylines(map_img, [raw_pixels], False, (0, 0, 255), 1)
+            for point in self.raw_centerline_result:
+                cv2.circle(map_img, world_to_map(point), 2, (0, 0, 255), -1)
+
+        # Open smoothed first-lap centerline: green, never force-closed here.
+        if len(self.smooth_centerline_result) >= 2:
+            smooth_pixels = np.array(
+                [world_to_map(point) for point in self.smooth_centerline_result],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            cv2.polylines(map_img, [smooth_pixels], False, (0, 220, 80), 2)
+
+        # Minimum-curvature line is generated once after confirmed lap closure.
+        if len(self.racing_line_result) >= 2:
+            racing_pixels = np.array(
+                [world_to_map(point) for point in self.racing_line_result],
+                dtype=np.int32,
+            ).reshape((-1, 1, 2))
+            cv2.polylines(map_img, [racing_pixels], True, (0, 140, 255), 2)
+
+        # Dry-run pure-pursuit target point.
+        if self.proposed_control.valid and self.proposed_control.target_point is not None:
+            cv2.circle(
+                map_img,
+                world_to_map(self.proposed_control.target_point),
+                6,
+                (255, 255, 0),
+                2,
+            )
         
         cv2.circle(map_img, (cx, cy), 6, (0, 255, 255), -1)
         dx = int(cx + 12 * math.sin(theta - self.ekf.x[2]))
