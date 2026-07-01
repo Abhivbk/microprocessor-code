@@ -35,6 +35,7 @@ class TestConsoleApp:
         self.root.configure(bg="#101010")
 
         self.latest_imu = None
+        self.imu_feedback_fresh = False
         self.latest_actuator = None
         self.latest_image = None
 
@@ -51,9 +52,9 @@ class TestConsoleApp:
         self.vision_status = "Disconnected"
         self.ctrl_status = "Disconnected"
 
-        self.desired = {
+        self.manual_desired = {
             "throttle": 0.0,
-            "brake": 0.0,
+            "brake": 1.0,
             "steering": 0.0,
         }
 
@@ -98,7 +99,6 @@ class TestConsoleApp:
         threading.Thread(target=self._yolo_worker_thread, daemon=True).start()
 
         self.root.after(50, self.refresh_ui)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
         title = tk.Label(
@@ -115,7 +115,6 @@ class TestConsoleApp:
 
         left = tk.Frame(main, bg="#101010")
         left.pack(side="left", fill="both", expand=False)
-
         right = tk.Frame(main, bg="#101010")
         right.pack(side="right", fill="both", expand=True)
 
@@ -163,22 +162,20 @@ class TestConsoleApp:
         ).pack(pady=(0, 8))
 
     def _make_section(self, parent, title_text):
-        frame = tk.LabelFrame(
-            parent,
-            text=title_text,
-            fg="cyan",
-            bg="#181818",
-            font=("Arial", 12, "bold"),
-            bd=2
-        )
+        frame = tk.LabelFrame(parent, text=title_text, fg="cyan", bg="#181818", font=("Arial", 12, "bold"), bd=2)
         frame.pack(fill="x", padx=8, pady=8)
         return frame
+
+    def _build_slam_panel(self, parent):
+        frame = self._make_section(parent, "EKF SLAM Measurements (Range, Bearing)")
+        self.slam_text_var = tk.StringVar(value="No detections yet")
+        tk.Label(frame, textvariable=self.slam_text_var, fg="yellow", bg="#181818", font=("Consolas", 10), justify="left", anchor="w").pack(fill="x", padx=12, pady=8)
 
     def _build_controls_panel(self, parent):
         frame = self._make_section(parent, "Control Output -> SHM")
 
         self.throttle_var = tk.DoubleVar(value=0.0)
-        self.brake_var = tk.DoubleVar(value=0.0)
+        self.brake_var = tk.DoubleVar(value=1.0)
         self.steering_var = tk.DoubleVar(value=0.0)
 
         self.throttle_label = tk.StringVar(value="Throttle: 0.000")
@@ -187,16 +184,13 @@ class TestConsoleApp:
 
         tk.Label(frame, textvariable=self.throttle_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(8, 2))
         ttk.Scale(frame, from_=0.0, to=1.0, variable=self.throttle_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
-
         tk.Label(frame, textvariable=self.brake_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Scale(frame, from_=0.0, to=1.0, variable=self.brake_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
-
         tk.Label(frame, textvariable=self.steering_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Scale(frame, from_=-1.0, to=1.0, variable=self.steering_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
 
         button_row = tk.Frame(frame, bg="#181818")
         button_row.pack(fill="x", padx=12, pady=12)
-
         tk.Button(button_row, text="Center Steering", command=self.center_steering, width=15).pack(side="left", padx=4)
         tk.Button(button_row, text="Zero Throttle", command=self.zero_throttle, width=15).pack(side="left", padx=4)
         tk.Button(button_row, text="Full Brake", command=self.full_brake, width=15).pack(side="left", padx=4)
@@ -262,7 +256,6 @@ class TestConsoleApp:
             bd=2
         )
         frame.pack(fill="both", expand=True, padx=8, pady=8)
-
         self.image_label = tk.Label(frame, bg="black")
         self.image_label.pack(fill="both", expand=True, padx=10, pady=10)
 
@@ -373,9 +366,11 @@ class TestConsoleApp:
         self.map_window.withdraw()
 
     def on_slider_change(self, _=None):
-        self.desired["throttle"] = round(float(self.throttle_var.get()), 3)
-        self.desired["brake"] = round(float(self.brake_var.get()), 3)
-        self.desired["steering"] = round(float(self.steering_var.get()), 3)
+        self.manual_desired["throttle"] = round(float(self.throttle_var.get()), 3)
+        self.manual_desired["brake"] = round(float(self.brake_var.get()), 3)
+        self.manual_desired["steering"] = round(float(self.steering_var.get()), 3)
+        if not self.autonomy_enabled:
+            self._set_desired(self.manual_desired)
 
     def center_steering(self):
         self.steering_var.set(0.0)
@@ -386,6 +381,8 @@ class TestConsoleApp:
         self.on_slider_change()
 
     def full_brake(self):
+        if self.autonomy_enabled:
+            self._disable_autonomy("Manual emergency brake")
         self.brake_var.set(1.0)
         self.throttle_var.set(0.0)
         self.on_slider_change()
