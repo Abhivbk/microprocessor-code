@@ -1,130 +1,71 @@
 import sys
 import os
 import time
-import tkinter as tk
+import mmap
+import struct
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import fsds
 
-from net_utils import TcpBroadcastServer
-
-
 VEHICLE_NAME = "FSCar"
-IMU_NAME = "Imu"
-PORT = 81
 
+SHARED_MEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sharedmemory", "forground"))
+IMU_BIN_PATH = os.path.join(SHARED_MEM_DIR, "ekfin_imu_groundspeed_gyro.bin")
+
+BINARY_FORMAT = "<Q11f"
+STRUCT_SIZE = struct.calcsize(BINARY_FORMAT)
 
 def connect_fsds_forever():
     while True:
         try:
             client = fsds.FSDSClient()
             client.confirmConnection()
-            print("[imu_speed_node] Connected to FSDS")
             return client
         except Exception as e:
-            print(f"[imu_speed_node] FSDS not ready: {e}")
+            print(f"[imu_speed_node] FSDS not ready: {e}", flush=True)
             time.sleep(2)
 
+def update_imu():
+    os.makedirs(SHARED_MEM_DIR, exist_ok=True)
+    
+    # Pre-allocate
+    if not os.path.exists(IMU_BIN_PATH) or os.path.getsize(IMU_BIN_PATH) != STRUCT_SIZE:
+        with open(IMU_BIN_PATH, "wb") as f:
+            f.write(b"\x00" * STRUCT_SIZE)
 
-client = connect_fsds_forever()
+    with open(IMU_BIN_PATH, "r+b") as f:
+        ram = mmap.mmap(f.fileno(), STRUCT_SIZE)
 
-tcp = TcpBroadcastServer(bind_host="0.0.0.0", bind_port=PORT)
-tcp.start()
-
-
-def get_packet():
-    global client
-    try:
-        state = client.getCarState(VEHICLE_NAME)
-        imu = client.getImuData(imu_name=IMU_NAME, vehicle_name=VEHICLE_NAME)
-    except Exception:
         client = connect_fsds_forever()
-        state = client.getCarState(VEHICLE_NAME)
-        imu = client.getImuData(imu_name=IMU_NAME, vehicle_name=VEHICLE_NAME)
+        print("[imu_speed_node] Started...", flush=True)
 
-    return {
-        "timestamp_ms": int(time.time() * 1000),
-        "ground_speed_mps": float(state.speed),
-        "imu": {
-            "angular_velocity": {
-                "x": float(imu.angular_velocity.x_val),
-                "y": float(imu.angular_velocity.y_val),
-                "z": float(imu.angular_velocity.z_val),
-            },
-            "linear_acceleration": {
-                "x": float(imu.linear_acceleration.x_val),
-                "y": float(imu.linear_acceleration.y_val),
-                "z": float(imu.linear_acceleration.z_val),
-            },
-            "orientation": {
-                "x": float(imu.orientation.x_val),
-                "y": float(imu.orientation.y_val),
-                "z": float(imu.orientation.z_val),
-                "w": float(imu.orientation.w_val),
-            },
-        },
-    }
+        while True:
+            try:
+                state = client.getCarState(VEHICLE_NAME)
+                imu_data = client.getImuData(vehicle_name=VEHICLE_NAME)
 
+                now_ms = int(time.time() * 1000)
+                speed = float(state.kinematics_estimated.linear_velocity.get_length())
+                
+                ang_vel = imu_data.angular_velocity
+                lin_acc = imu_data.linear_acceleration
+                ori = imu_data.orientation
 
-root = tk.Tk()
-root.title("IMU + Ground Speed Node")
-root.geometry("760x360")
-root.configure(bg="#1a1a1a")
+                packed_data = struct.pack(
+                    BINARY_FORMAT,
+                    now_ms,
+                    speed,
+                    float(ang_vel.x_val), float(ang_vel.y_val), float(ang_vel.z_val),
+                    float(lin_acc.x_val), float(lin_acc.y_val), float(lin_acc.z_val),
+                    float(ori.x_val), float(ori.y_val), float(ori.z_val), float(ori.w_val)
+                )
 
-title_label = tk.Label(
-    root,
-    text="IMU + Ground Speed",
-    font=("Arial", 18, "bold"),
-    fg="cyan",
-    bg="#1a1a1a"
-)
-title_label.pack(pady=10)
+                ram[0:STRUCT_SIZE] = packed_data
+                time.sleep(0.05)
 
-speed_var = tk.StringVar(value="Ground speed: 0.000 m/s")
-ang_var = tk.StringVar(value="Angular vel: x=0 y=0 z=0")
-lin_var = tk.StringVar(value="Linear acc: x=0 y=0 z=0")
-ori_var = tk.StringVar(value="Orientation: x=0 y=0 z=0 w=1")
-status_var = tk.StringVar(value="Status: Waiting for FSDS")
+            except Exception as e:
+                print(f"[imu_speed_node] Error: {e}", flush=True)
+                client = connect_fsds_forever()
 
-for var in [speed_var, ang_var, lin_var, ori_var, status_var]:
-    tk.Label(
-        root,
-        textvariable=var,
-        font=("Arial", 13),
-        fg="white",
-        bg="#1a1a1a",
-        anchor="w",
-        justify="left"
-    ).pack(fill="x", padx=20, pady=6)
-
-
-def update_ui():
-    try:
-        data = get_packet()
-        speed_var.set(f"Ground speed: {data['ground_speed_mps']:.3f} m/s")
-
-        av = data["imu"]["angular_velocity"]
-        la = data["imu"]["linear_acceleration"]
-        ori = data["imu"]["orientation"]
-
-        ang_var.set(f"Angular vel: x={av['x']:+.4f}  y={av['y']:+.4f}  z={av['z']:+.4f}")
-        lin_var.set(f"Linear acc : x={la['x']:+.4f}  y={la['y']:+.4f}  z={la['z']:+.4f}")
-        ori_var.set(f"Orientation: x={ori['x']:+.4f}  y={ori['y']:+.4f}  z={ori['z']:+.4f}  w={ori['w']:+.4f}")
-
-        status_var.set("Status: OK")
-        tcp.send_json(data)
-
-    except Exception as e:
-        status_var.set(f"Status: Error - {e}")
-
-    root.after(50, update_ui)
-
-
-def on_close():
-    tcp.stop()
-    root.destroy()
-
-
-root.protocol("WM_DELETE_WINDOW", on_close)
-root.after(100, update_ui)
-root.mainloop()
+if __name__ == "__main__":
+    update_imu()

@@ -14,7 +14,9 @@ fn main() {
     });
 
     // Give FSDS time to start
-    thread::sleep(Duration::from_secs(25));
+    thread::sleep(Duration::from_secs(30));
+
+
 
     let tx_control = tx.clone();
     let handle_control = thread::spawn(move || {
@@ -43,14 +45,23 @@ fn main() {
         );
     });
 
+    let tx_actuator = tx.clone();
+    let handle_actuator = thread::spawn(move || {
+        runpythonfile_stream(
+            "python/actuator_state_node.py",
+            "actuator_state_node.py",
+            tx_actuator,
+        );
+    });
+
     drop(tx);
 
     while let Ok((tag, line)) = rx.recv() {
         println!("[{tag}] {line}");
     }
 
-    handle_engine.join().expect("engine.py thread panicked");
     handle_control
+
         .join()
         .expect("control_input_node.py thread panicked");
     handle_imu
@@ -59,4 +70,7 @@ fn main() {
     handle_vision
         .join()
         .expect("vision_node.py thread panicked");
+    handle_actuator
+        .join()
+        .expect("actuator_state_node.py thread panicked");
 }

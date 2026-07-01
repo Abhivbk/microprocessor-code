@@ -7,7 +7,7 @@ import time
 RPC_PORT = 41451
 
 
-def wait_for_port(port, timeout=60):
+def wait_for_port(port, timeout=120):
     """Wait until the simulator RPC port becomes available."""
     start = time.time()
 
@@ -43,21 +43,45 @@ def run_fsds_as_spectator_server():
 
 
 if __name__ == "__main__":
+    import sys
 
-    print("Starting FSDS...", flush=True)
-
-    proc = run_fsds_as_spectator_server()
-
-    print("Waiting for simulator RPC port...", flush=True)
-
-    if wait_for_port(RPC_PORT):
-        print("FSDS_READY", flush=True)
-    else:
-        print("ERROR: RPC port did not open", flush=True)
-
-    # Keep engine.py alive so Rust thread does not exit
-    try:
-        while proc.poll() is None:
+    # Retry detection a few times — FSDS port may open slowly
+    already_running = False
+    for _ in range(5):
+        try:
+            with socket.create_connection(("127.0.0.1", RPC_PORT), timeout=2):
+                already_running = True
+                break
+        except OSError:
             time.sleep(1)
-    except KeyboardInterrupt:
-        proc.terminate()
+
+    if already_running:
+        print("FSDS is already running. Connecting to existing instance...", flush=True)
+        print("FSDS_READY", flush=True)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    else:
+        print("Starting FSDS...", flush=True)
+        try:
+            proc = run_fsds_as_spectator_server()
+        except Exception as e:
+            print(f"ERROR starting FSDS: {e}", flush=True)
+            sys.exit(1)
+
+        print("Waiting for simulator RPC port...", flush=True)
+
+        if wait_for_port(RPC_PORT):
+            print("FSDS_READY", flush=True)
+        else:
+            # Port timed out but FSDS may still be loading — keep alive anyway
+            print("WARNING: RPC port timeout — FSDS may still be loading. Staying alive...", flush=True)
+
+        # Keep engine.py alive so Rust thread does not exit
+        try:
+            while proc.poll() is None:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            proc.terminate()

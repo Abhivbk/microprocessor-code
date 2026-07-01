@@ -1,0 +1,8 @@
+numpy
+opencv-python
+pygame
+Pillow
+pyserial
+msgpack
+msgpack-rpc-python
+tornado
