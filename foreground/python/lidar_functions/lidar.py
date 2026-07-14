@@ -1,98 +1,97 @@
-import math
+import time
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 VEHICLE_NAME = "FSCar"
-LIDAR_NAME = "Lidar"
+LIDAR_NAME = "Lidar1"
 
 LIDAR_W = 700
 LIDAR_H = 540
 LIDAR_RANGE_METERS = 20.0
 LIDAR_CLUSTER_DIST = 0.30
-LIDAR_MIN_CLUSTER_POINTS = 1
+LIDAR_MIN_CLUSTER_POINTS = 2
 LIDAR_MAX_CLUSTER_POINTS = 60
-MAX_CONE_SPREAD_X = 1.2
-MAX_CONE_SPREAD_Y = 1.2
-
-def euclidean_2d(p1, p2):
-    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+MAX_CONE_SPREAD_X = 0.50
+MAX_CONE_SPREAD_Y = 0.50
 
 def cluster_lidar_points(points_xy, cluster_dist=LIDAR_CLUSTER_DIST):
-    clusters = []
-    used = np.zeros(len(points_xy), dtype=bool)
+    """Label 2-D points connected by neighbour distances below cluster_dist."""
+    points = np.asarray(points_xy, dtype=np.float32)
+    if len(points) == 0:
+        return np.empty(0, dtype=np.int32)
 
-    for i in range(len(points_xy)):
-        if used[i]:
-            continue
+    # The KD-tree finds only nearby pairs; SciPy groups their connected graph.
+    pairs = cKDTree(points).query_pairs(cluster_dist, output_type="ndarray")
+    if pairs.size:
+        deltas = points[pairs[:, 0]] - points[pairs[:, 1]]
+        pairs = pairs[np.einsum("ij,ij->i", deltas, deltas) < cluster_dist**2]
+    if pairs.size == 0:
+        return np.arange(len(points), dtype=np.int32)
 
-        cluster = [points_xy[i]]
-        used[i] = True
+    rows = np.concatenate((pairs[:, 0], pairs[:, 1]))
+    cols = np.concatenate((pairs[:, 1], pairs[:, 0]))
+    graph = coo_matrix(
+        (np.ones(len(rows), dtype=np.uint8), (rows, cols)),
+        shape=(len(points), len(points)),
+    ).tocsr()
+    return connected_components(graph, directed=False, return_labels=True)[1]
 
-        changed = True
-        while changed:
-            changed = False
-            for j in range(len(points_xy)):
-                if used[j]:
-                    continue
-                for cp in cluster:
-                    if euclidean_2d(points_xy[j], cp) < cluster_dist:
-                        cluster.append(points_xy[j])
-                        used[j] = True
-                        changed = True
-                        break
-
-        clusters.append(cluster)
-
-    return clusters
-
-def detect_cones_lidar(client):
+def detect_cones_lidar(client, profile=None):
     """
     Processes active lidar point cloud data to filter, cluster, and detect cones.
     Returns:
-        roi (list of (x, y) tuples): filtered point cloud points in the Region of Interest
+        roi (Nx2 ndarray): filtered point-cloud points in the region of interest
         cones (list of (cx, cy) tuples): coordinates of detected cone centers
+        timestamp_ns (int): FSDS timestamp of the LiDAR scan
     """
+    rpc_started = time.perf_counter()
     lidar = client.getLidarData(lidar_name=LIDAR_NAME, vehicle_name=VEHICLE_NAME)
+    if profile is not None:
+        profile["rpc_s"] = time.perf_counter() - rpc_started
+
+    processing_started = time.perf_counter()
     if len(lidar.point_cloud) < 3:
-        return [], []
+        if profile is not None:
+            profile["processing_s"] = time.perf_counter() - processing_started
+        return [], [], int(lidar.time_stamp)
 
-    pts = np.array(lidar.point_cloud, dtype=np.float32).reshape(-1, 3)
+    pts = np.asarray(lidar.point_cloud, dtype=np.float32).reshape(-1, 3)
+    mask = (
+        (pts[:, 0] >= 0.0)
+        & (pts[:, 0] <= LIDAR_RANGE_METERS)
+        & (np.abs(pts[:, 1]) <= 10.0)
+        & (pts[:, 2] >= -1.5)
+        & (pts[:, 2] <= 1.0)
+    )
+    roi = pts[mask, :2]
 
-    roi = []
-    for p in pts:
-        x, y, z = float(p[0]), float(p[1]), float(p[2])
+    if len(roi) == 0:
+        if profile is not None:
+            profile["processing_s"] = time.perf_counter() - processing_started
+        return [], [], int(lidar.time_stamp)
 
-        if x < 0.0 or x > LIDAR_RANGE_METERS:
-            continue
-        if abs(y) > 10.0:
-            continue
-        if z < -1.5 or z > 1.0:
-            continue
+    labels = cluster_lidar_points(roi, LIDAR_CLUSTER_DIST)
 
-        roi.append((x, y))
+    # Sorting once lets NumPy calculate every cluster's statistics in bulk.
+    order = np.argsort(labels, kind="stable")
+    sorted_points, sorted_labels = roi[order], labels[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_labels)) + 1]
+    counts = np.diff(np.r_[starts, len(sorted_points)])
+    centres = np.add.reduceat(sorted_points, starts) / counts[:, None]
+    spreads = (
+        np.maximum.reduceat(sorted_points, starts)
+        - np.minimum.reduceat(sorted_points, starts)
+    )
+    valid = (
+        (counts >= LIDAR_MIN_CLUSTER_POINTS)
+        & (counts <= LIDAR_MAX_CLUSTER_POINTS)
+        & (spreads[:, 0] <= MAX_CONE_SPREAD_X)
+        & (spreads[:, 1] <= MAX_CONE_SPREAD_Y)
+    )
+    cones = [tuple(map(float, centre)) for centre in centres[valid]]
 
-    if not roi:
-        return [], []
-
-    clusters = cluster_lidar_points(roi, LIDAR_CLUSTER_DIST)
-
-    cones = []
-
-    for cluster in clusters:
-        n = len(cluster)
-        if n < LIDAR_MIN_CLUSTER_POINTS or n > LIDAR_MAX_CLUSTER_POINTS:
-            continue
-
-        xs = [p[0] for p in cluster]
-        ys = [p[1] for p in cluster]
-        cx = sum(xs) / n
-        cy = sum(ys) / n
-
-        spread_x = max(xs) - min(xs)
-        spread_y = max(ys) - min(ys)
-
-        if spread_x > MAX_CONE_SPREAD_X or spread_y > MAX_CONE_SPREAD_Y:
-            continue
-
-        cones.append((cx, cy))
-
-    return roi, cones
+    if profile is not None:
+        profile["processing_s"] = time.perf_counter() - processing_started
+    return roi, cones, int(lidar.time_stamp)
