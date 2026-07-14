@@ -1,8 +1,14 @@
 import math
+import time
+import traceback
 import numpy as np
 from scipy.spatial import Delaunay
 from scipy.optimize import minimize
 from scipy.interpolate import splprep, splev
+
+PATH_START_THROTTLE = 0.30
+PATH_START_DURATION_S = 1.0
+PATH_MOVING_SPEED_MPS = 0.20
 
 class AutonomousController:
     def __init__(self, target_speed=4.0):
@@ -25,6 +31,19 @@ class AutonomousController:
         self.last_throttle = 0.0
         self.last_brake = 0.0
         self.last_steering = 0.0
+        self.progressive_path = False
+        self.path_started_at = None
+        self.path_evidence_count = 0
+        self.last_status = "IDLE"
+        self._last_error = None
+
+    def _report_error(self, stage, error):
+        """Print each distinct controller failure once instead of hiding it."""
+        key = (stage, type(error).__name__, str(error))
+        if key != self._last_error:
+            self._last_error = key
+            print(f"[Autonomy] {stage} failed: {error}", flush=True)
+            traceback.print_exc()
 
     def get_distance(self, p1, p2):
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
@@ -33,6 +52,7 @@ class AutonomousController:
         """
         Uses Delaunay Triangulation to extract the centerline between blue and yellow cones.
         """
+        self.path_evidence_count = 0
         blue_cones = [c for c in ekf_state if 'blue' in c['color']]
         yellow_cones = [c for c in ekf_state if 'yellow' in c['color']]
         all_cones = blue_cones + yellow_cones
@@ -66,7 +86,7 @@ class AutonomousController:
                             dist = self.get_distance(points[idx1], points[idx2])
                             if dist <= max_track_width:
                                 cross_edges.add(tuple(sorted((idx1, idx2))))
-                                
+
                 if not cross_edges:
                     for simplex in tri.simplices:
                         for i in range(3):
@@ -77,7 +97,7 @@ class AutonomousController:
                                 dist = self.get_distance(points[idx1], points[idx2])
                                 if dist <= max_track_width * 1.5:
                                     cross_edges.add(tuple(sorted((idx1, idx2))))
-
+                                 
                 for idx1, idx2 in cross_edges:
                     c1, c2 = colors[idx1], colors[idx2]
                     mx = (points[idx1][0] + points[idx2][0]) / 2.0
@@ -99,8 +119,8 @@ class AutonomousController:
                         fwd_dx /= mag
                         fwd_dy /= mag
                         waypoints.append((mx, my, fwd_dx, fwd_dy))
-            except Exception as e:
-                pass
+            except Exception as error:
+                self._report_error("Delaunay centreline", error)
 
         if not waypoints:
             return []
@@ -145,6 +165,8 @@ class AutonomousController:
                 unvisited.remove(best_pt)
                 current_pt = best_pt
 
+        self.path_evidence_count = len(ordered_waypoints)
+
         # B-Spline Smoothing
         if len(ordered_waypoints) >= 4:
             try:
@@ -159,7 +181,8 @@ class AutonomousController:
                     ordered_waypoints = list(zip(new_points[0], new_points[1]))
                 else:
                     ordered_waypoints = [(p[0], p[1]) for p in ordered_waypoints]
-            except Exception as e:
+            except Exception as error:
+                self._report_error("Centreline smoothing", error)
                 ordered_waypoints = [(p[0], p[1]) for p in ordered_waypoints]
         else:
             ordered_waypoints = [(p[0], p[1]) for p in ordered_waypoints]
@@ -167,159 +190,190 @@ class AutonomousController:
         self.last_waypoints = ordered_waypoints
         return ordered_waypoints
 
-    def mpc_control(self, current_speed, target_speed):
-        """
-        Model Predictive Controller (MPC) for Longitudinal Speed tracking.
-        Optimizes a sequence of accelerations to match target speed while minimizing jerk.
-        """
-        N = 5       # Prediction horizon
-        dt = 0.2    # Time step (1.0 second lookahead total)
-        
-        a0 = np.zeros(N)
-        bounds = [(-self.max_deceleration, self.max_acceleration) for _ in range(N)]
-        
-        def cost_fn(a):
-            cost = 0.0
-            v = current_speed
-            for k in range(N):
-                v = v + a[k] * dt
-                # Penalize deviation from target speed
-                cost += 10.0 * (v - target_speed)**2
-                # Penalize control effort
-                cost += 1.0 * (a[k])**2
-                # Penalize jerk
-                if k > 0:
-                    cost += 5.0 * (a[k] - a[k-1])**2
-            return cost
-            
-        try:
-            res = minimize(cost_fn, a0, bounds=bounds, method='SLSQP')
-            if res.success:
-                opt_accel = res.x[0]
+    def extract_progressive_centerline(self, ekf_state, vehicle_x, vehicle_y, vehicle_theta):
+        """Build the best short path available before a full centreline exists."""
+        orange = [c for c in ekf_state if "orange" in c["color"]]
+        blue = [c for c in ekf_state if "blue" in c["color"]]
+        yellow = [c for c in ekf_state if "yellow" in c["color"]]
+        cos_h, sin_h = math.cos(vehicle_theta), math.sin(vehicle_theta)
+        anchors, used_yellow = [], set()
+
+        # Greedily pair each blue cone with its nearest sensible yellow cone.
+        for left in blue:
+            options = []
+            for right in yellow:
+                if id(right) in used_yellow:
+                    continue
+                width = self.get_distance((left["x"], left["y"]), (right["x"], right["y"]))
+                mid = ((left["x"] + right["x"]) / 2.0, (left["y"] + right["y"]) / 2.0)
+                local_x = (mid[0] - vehicle_x) * cos_h + (mid[1] - vehicle_y) * sin_h
+                if 1.5 <= width <= 8.0 and 0.5 <= local_x <= 15.0:
+                    options.append((width, local_x, mid, right))
+            if options:
+                _, local_x, midpoint, right = min(options, key=lambda item: item[0])
+                used_yellow.add(id(right))
+                anchors.append((local_x, midpoint))
+
+        # Orange cones are an optional centre reference, never a requirement.
+        visible_orange = []
+        for cone in orange:
+            local_x = (cone["x"] - vehicle_x) * cos_h + (cone["y"] - vehicle_y) * sin_h
+            if -1.0 <= local_x <= 15.0:
+                visible_orange.append((local_x, cone))
+        if len(visible_orange) >= 2:
+            group = sorted(visible_orange, key=lambda item: abs(item[0]))[:4]
+            centre = (
+                sum(item[1]["x"] for item in group) / len(group),
+                sum(item[1]["y"] for item in group) / len(group),
+            )
+            centre_x = (centre[0] - vehicle_x) * cos_h + (centre[1] - vehicle_y) * sin_h
+            anchors.append((centre_x, centre))
+
+        if not anchors:
+            self.path_evidence_count = 0
+            self.last_status = "WAITING: no usable centreline waypoint"
+            return []
+
+        # Nearby observations represent the same path point; merge rather than stop.
+        merged = []
+        for _, point in sorted(anchors, key=lambda item: item[0]):
+            if merged and self.get_distance(merged[-1], point) < 0.5:
+                merged[-1] = ((merged[-1][0] + point[0]) / 2.0, (merged[-1][1] + point[1]) / 2.0)
             else:
-                opt_accel = 1.5 * (target_speed - current_speed)
-        except Exception:
-            opt_accel = 1.5 * (target_speed - current_speed)
-            
-        opt_accel = max(-self.max_deceleration, min(self.max_acceleration, opt_accel))
-            
-        throttle = 0.0
-        brake = 0.0
-        
-        if opt_accel > 0:
-            throttle = opt_accel / self.max_acceleration
-        else:
-            brake = -opt_accel / self.max_deceleration
-            
-        return throttle, brake
+                merged.append(point)
+
+        waypoints = [(vehicle_x, vehicle_y)] + merged
+        reference = waypoints[-2]
+        dx, dy = waypoints[-1][0] - reference[0], waypoints[-1][1] - reference[1]
+        distance = math.hypot(dx, dy)
+        if distance < 0.2:
+            dx, dy, distance = cos_h, sin_h, 1.0
+        ux, uy = dx / distance, dy / distance
+        extension = max(2.0, self.lookahead_dist)
+        waypoints.append((waypoints[-1][0] + ux * extension, waypoints[-1][1] + uy * extension))
+        self.path_evidence_count = len(merged)
+        self.last_waypoints = waypoints
+        return waypoints
+
+    def mpc_control(self, current_speed, target_speed):
+        """Optimize a short acceleration sequence for longitudinal speed."""
+        horizon, dt = 5, 0.2
+        initial = np.zeros(horizon)
+        bounds = [(-self.max_deceleration, self.max_acceleration)] * horizon
+
+        def cost_fn(accelerations):
+            cost, speed = 0.0, current_speed
+            for index, acceleration in enumerate(accelerations):
+                speed += acceleration * dt
+                cost += 10.0 * (speed - target_speed) ** 2 + acceleration ** 2
+                if index > 0:
+                    cost += 5.0 * (acceleration - accelerations[index - 1]) ** 2
+            return cost
+
+        try:
+            result = minimize(cost_fn, initial, bounds=bounds, method="SLSQP")
+            acceleration = result.x[0] if result.success else 1.5 * (target_speed - current_speed)
+        except Exception as error:
+            self._report_error("Longitudinal controller", error)
+            acceleration = 1.5 * (target_speed - current_speed)
+
+        acceleration = max(-self.max_deceleration, min(self.max_acceleration, acceleration))
+        if acceleration > 0.0:
+            return acceleration / self.max_acceleration, 0.0
+        return 0.0, -acceleration / self.max_deceleration
 
     def stanley_control(self, vehicle_x, vehicle_y, vehicle_theta, vehicle_speed, waypoints):
-        """
-        Stanley Controller for Lateral Control.
-        """
+        """Calculate lateral steering from heading and cross-track error."""
         if not waypoints:
             return self.last_steering
-            
-        closest_idx = None
-        target_local_y = None
-        
-        for i, pt in enumerate(waypoints):
-            dx = pt[0] - vehicle_x
-            dy = pt[1] - vehicle_y
-            
-            # Local coordinates (AirSim NED: +X is Forward, +Y is Right)
+        closest_idx = target_local_y = None
+        for index, point in enumerate(waypoints):
+            dx, dy = point[0] - vehicle_x, point[1] - vehicle_y
             local_x = dx * math.cos(vehicle_theta) + dy * math.sin(vehicle_theta)
             local_y = -dx * math.sin(vehicle_theta) + dy * math.cos(vehicle_theta)
-            
-            # ONLY consider waypoints that are IN FRONT of the car
             if local_x > 0.0:
-                closest_idx = i
-                target_local_y = local_y
+                closest_idx, target_local_y = index, local_y
                 break
-                
         if closest_idx is None:
             return self.last_steering
-            
-        target_wp = waypoints[closest_idx]
-        self.last_target_point = (target_wp[0], target_wp[1])
-        
-        # Cross-track error
-        e_f = target_local_y
-        
-        # Path Heading Error (psi_e)
+
+        target = waypoints[closest_idx]
+        self.last_target_point = target
         lookahead_idx = closest_idx
-        for j in range(closest_idx + 1, len(waypoints)):
-            dist_to_j = math.hypot(waypoints[j][0] - target_wp[0], waypoints[j][1] - target_wp[1])
-            if dist_to_j >= self.lookahead_dist:
-                lookahead_idx = j
+        for index in range(closest_idx + 1, len(waypoints)):
+            if self.get_distance(waypoints[index], target) >= self.lookahead_dist:
+                lookahead_idx = index
                 break
-                
         if lookahead_idx > closest_idx:
-            next_wp = waypoints[lookahead_idx]
-            path_yaw = math.atan2(next_wp[1] - target_wp[1], next_wp[0] - target_wp[0])
+            following = waypoints[lookahead_idx]
+            path_yaw = math.atan2(following[1] - target[1], following[0] - target[0])
         else:
             path_yaw = vehicle_theta
-            
-        psi_e = path_yaw - vehicle_theta
-        psi_e = (psi_e + math.pi) % (2 * math.pi) - math.pi
-        
+
+        heading_error = (path_yaw - vehicle_theta + math.pi) % (2 * math.pi) - math.pi
         safe_speed = max(1.0, vehicle_speed)
-        steering = -(psi_e + math.atan2(self.k_e * e_f, safe_speed + self.k_s))
-        
-        steering = max(-1.0, min(1.0, steering / 0.5))
-        return steering
+        steering = -(heading_error + math.atan2(self.k_e * target_local_y, safe_speed + self.k_s))
+        return max(-1.0, min(1.0, steering / 0.5))
 
     def compute_commands(self, ekf_state, vehicle_x, vehicle_y, vehicle_theta, vehicle_speed):
         waypoints = self.extract_centerline(ekf_state, vehicle_x, vehicle_y, vehicle_theta)
-        
+        self.progressive_path = not waypoints
+        if self.progressive_path:
+            waypoints = self.extract_progressive_centerline(
+                ekf_state, vehicle_x, vehicle_y, vehicle_theta,
+            )
         if not waypoints:
             self.last_throttle = 0.0
-            self.last_brake = min(1.0, self.last_brake + 0.05)
+            self.last_brake = 1.0
+            self.path_started_at = None
             return self.last_throttle, self.last_steering, self.last_brake
-            
-        # 1. Target Speed Profile Generation
-        target_speed = self.target_speed
-        
-        # Estimate upcoming curvature
+        if self.path_started_at is None:
+            self.path_started_at = time.monotonic()
+
+        if self.path_evidence_count <= 1:
+            target_speed = min(self.target_speed, 0.5)
+        elif self.path_evidence_count < 4:
+            target_speed = min(self.target_speed, 0.8)
+        else:
+            target_speed = self.target_speed
+
         closest_idx = 0
-        for i, pt in enumerate(waypoints):
-            dx = pt[0] - vehicle_x
-            dy = pt[1] - vehicle_y
-            local_x = dx * math.cos(vehicle_theta) + dy * math.sin(vehicle_theta)
-            if local_x > 0.0:
-                closest_idx = i
+        for index, point in enumerate(waypoints):
+            dx, dy = point[0] - vehicle_x, point[1] - vehicle_y
+            if dx * math.cos(vehicle_theta) + dy * math.sin(vehicle_theta) > 0.0:
+                closest_idx = index
                 break
-                
         far_idx = closest_idx
-        for j in range(closest_idx + 1, len(waypoints)):
-            dist = math.hypot(waypoints[j][0] - waypoints[closest_idx][0], waypoints[j][1] - waypoints[closest_idx][1])
-            if dist >= 5.0:
-                far_idx = j
+        for index in range(closest_idx + 1, len(waypoints)):
+            if self.get_distance(waypoints[index], waypoints[closest_idx]) >= 5.0:
+                far_idx = index
                 break
-                
-        if far_idx > closest_idx and closest_idx + 1 < len(waypoints):
-            dy = waypoints[far_idx][1] - waypoints[closest_idx][1]
-            dx = waypoints[far_idx][0] - waypoints[closest_idx][0]
-            far_yaw = math.atan2(dy, dx)
-            
-            near_dy = waypoints[closest_idx+1][1] - waypoints[closest_idx][1]
-            near_dx = waypoints[closest_idx+1][0] - waypoints[closest_idx][0]
-            near_yaw = math.atan2(near_dy, near_dx)
-            
-            yaw_diff = abs((far_yaw - near_yaw + math.pi) % (2*math.pi) - math.pi)
-            
-            # Slow down proportionally for corners
-            if yaw_diff > math.radians(20):
-                target_speed = max(2.0, self.target_speed - 2.0 * (yaw_diff / math.radians(45)))
-                
-        # 2. Longitudinal Control (MPC)
+        if self.path_evidence_count >= 4 and far_idx > closest_idx and closest_idx + 1 < len(waypoints):
+            far_yaw = math.atan2(
+                waypoints[far_idx][1] - waypoints[closest_idx][1],
+                waypoints[far_idx][0] - waypoints[closest_idx][0],
+            )
+            near_yaw = math.atan2(
+                waypoints[closest_idx + 1][1] - waypoints[closest_idx][1],
+                waypoints[closest_idx + 1][0] - waypoints[closest_idx][0],
+            )
+            yaw_difference = abs((far_yaw - near_yaw + math.pi) % (2 * math.pi) - math.pi)
+            if yaw_difference > math.radians(20):
+                target_speed = max(0.6, target_speed - 2.0 * (yaw_difference / math.radians(45)))
+
         throttle, brake = self.mpc_control(vehicle_speed, target_speed)
-        
-        # 3. Lateral Control (Stanley)
+        if (vehicle_speed < PATH_MOVING_SPEED_MPS
+                and time.monotonic() - self.path_started_at < PATH_START_DURATION_S):
+            throttle, brake = max(throttle, PATH_START_THROTTLE), 0.0
         steering = self.stanley_control(vehicle_x, vehicle_y, vehicle_theta, vehicle_speed, waypoints)
-        
+
         self.last_throttle = throttle
         self.last_brake = brake
         self.last_steering = steering
-        
+        if self.path_evidence_count <= 1:
+            self.last_status = "SEED PATH: 1 observed waypoint"
+        elif self.path_evidence_count < 4:
+            self.last_status = f"POLYLINE: {self.path_evidence_count} observed waypoints"
+        else:
+            self.last_status = f"TRACKING: {self.path_evidence_count} centreline waypoints"
         return throttle, steering, brake

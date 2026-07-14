@@ -2,6 +2,7 @@ import struct
 import json
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
@@ -41,7 +42,7 @@ LIDAR_X_M = 0.45
 LIDAR_Y_M = 0.0
 LIDAR_PROJECTION_MARGIN_PX = 10.0
 CANDIDATE_MAX_RANGE_M = 12.0
-COLOR_MAX_RANGE_M = 8.0
+COLOR_MAX_RANGE_M = 10.0
 YOLO_BASE_CONFIDENCE = 0.60
 YOLO_MIN_CONFIDENCE = 0.45
 COLOR_CONFIRM_SCORE = 0.90
@@ -143,10 +144,11 @@ class TestConsoleApp:
         self.map_y_min_m = -MAP_INITIAL_HALF_SPAN_M
         self.map_y_max_m = MAP_INITIAL_HALF_SPAN_M
 
-        # Initialize Autonomous Controller (Speed capped to 1.0 m/s)
-        self.controller = AutonomousController(target_speed=1.0)
+        # Initialize Autonomous Controller with a conservative simulation speed.
+        self.controller = AutonomousController(target_speed=1.5)
         self.autonomous_mode = False
         self.autonomy_button_text = tk.StringVar(value="Enable Autonomy")
+        self.autonomy_status = "IDLE"
 
         # Dynamic Tuning variables initialized from self.controller defaults
         self.tune_L_var = tk.DoubleVar(value=self.controller.L)
@@ -452,7 +454,7 @@ class TestConsoleApp:
         self.lbl_target_speed.set(f"Target Speed: {target_speed:.2f} m/s")
 
     def reset_tune_defaults(self):
-        defaults = AutonomousController(target_speed=1.0)
+        defaults = AutonomousController(target_speed=1.5)
         self.tune_L_var.set(defaults.L)
         self.tune_max_steer_var.set(math.degrees(defaults.max_steer_angle))
         self.tune_max_accel_var.set(defaults.max_acceleration)
@@ -552,17 +554,26 @@ class TestConsoleApp:
             if hasattr(self, "autonomy_button"):
                 self.autonomy_button.configure(bg=UI_SUCCESS, activebackground="#2ea043")
 
+    def _set_autonomy_status(self, status):
+        if status != getattr(self, "autonomy_status", None):
+            self.autonomy_status = status
+            print(f"[Autonomy] {status}", flush=True)
+
     def toggle_autonomy(self):
         """Single toggle used by both the UI button and the P key."""
         self.autonomous_mode = not self.autonomous_mode
         if self.autonomous_mode:
             self.using_keyboard = False
+            if hasattr(self, "controller"):
+                self.controller.path_started_at = None
             self.steering_var.set(0.0)
             self.throttle_var.set(0.0)
             self.brake_var.set(1.0)
             self.on_slider_change()
+            self._set_autonomy_status("ENABLED: evaluating map")
         else:
             self._set_desired(self.manual_desired)
+            self._set_autonomy_status("IDLE")
         self._update_autonomy_ui()
         print(f"[Dashboard] Autonomous Mode: {self.autonomous_mode}")
 
@@ -751,17 +762,15 @@ class TestConsoleApp:
             ram = mmap.mmap(f.fileno(), STRUCT_SIZE)
             try:
                 while not self.shutdown_event.is_set():
-                    if self.autonomous_mode and not self.using_keyboard:
-                        if not self.initial_map_ready:
-                            self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
-                        else:
+                    try:
+                        if self.autonomous_mode and not self.using_keyboard:
                             ekf_state = []
                             for idx, l_info in enumerate(self.ekf.landmarks):
                                 color = l_info.get("color", "unknown").lower()
-                                if "blue" in color or "yellow" in color:
+                                if any(name in color for name in ("blue", "yellow", "orange")):
                                     lx_idx = 3 + 2 * idx
                                     ly_idx = 4 + 2 * idx
-                                    if lx_idx < len(self.ekf.x):
+                                    if ly_idx < len(self.ekf.x):
                                         ekf_state.append({
                                             "x": float(self.ekf.x[lx_idx]),
                                             "y": float(self.ekf.x[ly_idx]),
@@ -770,13 +779,18 @@ class TestConsoleApp:
 
                             speed, _ = self._current_motion()
                             thr, strng, brk = self.controller.compute_commands(
-                                ekf_state, self.ekf.x[0], self.ekf.x[1], self.ekf.x[2], speed
+                                ekf_state, self.ekf.x[0], self.ekf.x[1], self.ekf.x[2], speed,
                             )
                             self._set_desired({
                                 "throttle": thr,
                                 "steering": strng,
                                 "brake": brk,
                             })
+                            self._set_autonomy_status(self.controller.last_status)
+                    except Exception as error:
+                        self._set_desired({"throttle": 0.0, "brake": 1.0, "steering": 0.0})
+                        self._set_autonomy_status(f"ERROR: {type(error).__name__}: {error}")
+                        traceback.print_exc()
 
                     command = self._get_desired()
                     packed = struct.pack(
@@ -787,7 +801,10 @@ class TestConsoleApp:
                         command["steering"],
                     )
                     ram[0:STRUCT_SIZE] = packed
-                    self.ctrl_status = "Writing (mmap)"
+                    self.ctrl_status = (
+                        f"Writing (mmap) | {self.autonomy_status}"
+                        if self.autonomous_mode else "Writing (mmap)"
+                    )
                     self.shutdown_event.wait(0.05)
             finally:
                 # Always leave a fresh full-brake command for foreground.

@@ -264,6 +264,5 @@ class MappingLogicTests(unittest.TestCase):
         self.assertFalse(app.autonomous_mode)
         self.assertEqual(app.autonomy_button_text.get(), "Enable Autonomy")
 
-
 if __name__ == "__main__":
     unittest.main()
