@@ -40,6 +40,7 @@ class EKFSLAM:
         
         # Provisional landmarks: {"x": float, "y": float, "color": str, "hit_count": int}
         self.provisional_landmarks = []
+        self.heading_initialized = False
 
         # Keep track of history trace for trajectory rendering
         self.trajectory = []
@@ -85,19 +86,30 @@ class EKFSLAM:
             if len(self.trajectory) > 600:
                 self.trajectory.pop(0)
 
-    def update_heading(self, abs_theta):
+    def update_heading(self, abs_theta, heading_variance=math.radians(2.0) ** 2):
         """
-        Fuses absolute heading from IMU directly.
-        To prevent IMU jitter from aggressively teleporting X/Y coordinates 
-        via cross-covariance, we apply it directly to the theta state.
+        Fuse absolute IMU heading as a scalar EKF measurement.
         """
-        self.x[2] = self.normalize_angle(abs_theta)
+        H = np.zeros((1, len(self.x)), dtype=np.float64)
+        H[0, 2] = 1.0
+        innovation = self.normalize_angle(abs_theta - self.x[2])
+        S = float((H @ self.P @ H.T)[0, 0] + heading_variance)
+        if S <= 0.0:
+            return
+        K = (self.P @ H.T) / S
+        self.x = self.x + K[:, 0] * innovation
+        identity = np.eye(len(self.x), dtype=np.float64)
+        correction = identity - K @ H
+        self.P = correction @ self.P @ correction.T + (K * heading_variance) @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+        self.x[2] = self.normalize_angle(self.x[2])
 
     def update(self, fused_measurements):
         """
         Update state using a list of fused measurements.
         fused_measurements: list of dicts: {"range": float, "bearing": float, "color": str}
         """
+        used_landmarks = set()
         for meas in fused_measurements:
             r = meas.get("range")
             b = meas.get("bearing")
@@ -107,20 +119,37 @@ class EKFSLAM:
             if r is not None and r > 15.0:
                 continue
 
-            self._update_single(r, b, color)
+            matched_index = self._update_single(
+                r,
+                b,
+                color,
+                meas.get("candidate_id"),
+                used_landmarks,
+            )
+            if matched_index is not None:
+                used_landmarks.add(matched_index)
 
-    def _update_single(self, r, b, color):
+    def _update_single(self, r, b, color, candidate_id=None, used_landmarks=None):
         xv, yv, theta = self.x[0], self.x[1], self.x[2]
 
         n_landmarks = len(self.landmarks)
+        known_candidate_exists = (
+            candidate_id is not None
+            and any(
+                landmark.get("candidate_id") == candidate_id
+                for landmark in self.landmarks
+            )
+        )
 
-        # Data association: Find closest existing landmark of the SAME color class
+        # Data association is geometric. Colour is semantic evidence, not a hard
+        # gate, because a distant classifier result may later be corrected.
         best_idx = -1
         best_dist = self.assoc_threshold
+        used_landmarks = used_landmarks or set()
 
         for idx in range(n_landmarks):
             l_info = self.landmarks[idx]
-            if l_info["color"] != color:
+            if idx in used_landmarks:
                 continue
 
             lx_idx = 3 + 2 * idx
@@ -175,7 +204,14 @@ class EKFSLAM:
             except np.linalg.LinAlgError:
                 d_M = 999.0
 
-            if d_M < best_dist:
+            same_candidate = (
+                candidate_id is not None
+                and l_info.get("candidate_id") == candidate_id
+            )
+            if d_M < self.assoc_threshold and same_candidate:
+                best_dist = -1.0
+                best_idx = idx
+            elif best_dist >= 0.0 and d_M < best_dist:
                 best_dist = d_M
                 best_idx = idx
 
@@ -222,70 +258,63 @@ class EKFSLAM:
                 S_inv = np.linalg.inv(S) if r is not None else np.array([[1.0 / S[0, 0]]])
                 K = self.P @ H_i.T @ S_inv
                 self.x = self.x + K @ y_val
-                # Optimized O(M^2) Covariance Update using Associative Property
-                # P = P - K * (H * P), completely avoiding the O(M^3) dense multiplication!
-                self.P = self.P - K @ (H_i @ self.P)
+                identity = np.eye(len(self.x), dtype=np.float64)
+                correction = identity - K @ H_i
+                self.P = correction @ self.P @ correction.T + K @ Q_i @ K.T
+                self.P = 0.5 * (self.P + self.P.T)
                 self.x[2] = self.normalize_angle(self.x[2])
             except np.linalg.LinAlgError:
                 pass
                 
             self.landmarks[idx]["hit_count"] += 1
+            self.landmarks[idx]["color"] = color
+            if candidate_id is not None:
+                self.landmarks[idx]["candidate_id"] = candidate_id
+            return idx
+
+        elif known_candidate_exists:
+            # A tracked landmark produced an incompatible outlier. Reject it
+            # rather than duplicating the same physical cone in the map.
+            return None
 
         elif r is not None and len(self.landmarks) < 300:
-            # Global position of the observed cone (estimate)
-            xl_est = xv + r * math.cos(theta + b)
-            yl_est = yv + r * math.sin(theta + b)
-            
-            # Check if it matches a provisional landmark (Euclidean distance)
-            best_prov_idx = -1
-            best_prov_dist = 1.5  # 1.5 meters threshold for provisional matching
-            
-            for p_idx, prov in enumerate(self.provisional_landmarks):
-                if prov["color"] != color:
-                    continue
-                d = math.hypot(prov["x"] - xl_est, prov["y"] - yl_est)
-                if d < best_prov_dist:
-                    best_prov_dist = d
-                    best_prov_idx = p_idx
-                    
-            if best_prov_idx != -1:
-                prov = self.provisional_landmarks[best_prov_idx]
-                prov["hit_count"] += 1
-                # Moving average update
-                prov["x"] = (prov["x"] * (prov["hit_count"] - 1) + xl_est) / prov["hit_count"]
-                prov["y"] = (prov["y"] * (prov["hit_count"] - 1) + yl_est) / prov["hit_count"]
-                
-                if prov["hit_count"] >= 2:
-                    # Promote to Official Landmark
-                    self.x = np.append(self.x, [prov["x"], prov["y"]])
+            angle = theta + b
+            xl_est = xv + r * math.cos(angle)
+            yl_est = yv + r * math.sin(angle)
 
-                    # Expand Covariance Matrix
-                    old_size = len(self.P)
-                    new_P = np.zeros((old_size + 2, old_size + 2), dtype=np.float64)
-                    new_P[0:old_size, 0:old_size] = self.P
+            old_size = len(self.x)
+            G_state = np.zeros((2, old_size), dtype=np.float64)
+            G_state[:, 0:3] = np.array([
+                [1.0, 0.0, -r * math.sin(angle)],
+                [0.0, 1.0, r * math.cos(angle)],
+            ])
+            G_measurement = np.array([
+                [math.cos(angle), -r * math.sin(angle)],
+                [math.sin(angle), r * math.cos(angle)],
+            ])
 
-                    # Add landmark covariance block
-                    new_P[old_size, old_size] = self.init_p_landmark
-                    new_P[old_size + 1, old_size + 1] = self.init_p_landmark
+            landmark_cross = G_state @ self.P
+            landmark_covariance = (
+                G_state @ self.P @ G_state.T
+                + G_measurement @ self.Q_obs @ G_measurement.T
+            )
+            new_P = np.zeros((old_size + 2, old_size + 2), dtype=np.float64)
+            new_P[:old_size, :old_size] = self.P
+            new_P[old_size:, :old_size] = landmark_cross
+            new_P[:old_size, old_size:] = landmark_cross.T
+            new_P[old_size:, old_size:] = landmark_covariance
 
-                    self.P = new_P
+            self.x = np.append(self.x, [xl_est, yl_est])
+            self.P = 0.5 * (new_P + new_P.T)
+            self.landmarks.append({
+                "id": n_landmarks,
+                "candidate_id": candidate_id,
+                "color": color,
+                "hit_count": 1,
+            })
+            return n_landmarks
 
-                    # Add landmark metadata
-                    self.landmarks.append({
-                        "id": n_landmarks,
-                        "color": color,
-                        "hit_count": prov["hit_count"]
-                    })
-                    
-                    self.provisional_landmarks.pop(best_prov_idx)
-            else:
-                # Create a brand new provisional landmark
-                self.provisional_landmarks.append({
-                    "x": xl_est,
-                    "y": yl_est,
-                    "color": color,
-                    "hit_count": 1
-                })
+        return None
 
     @staticmethod
     def normalize_angle(angle):
