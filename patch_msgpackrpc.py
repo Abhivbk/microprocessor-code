@@ -19,14 +19,27 @@ def patch_msgpackrpc():
     with open(tcp_py, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Apply the fix for Python 3+ (Exception.message was removed)
+    original_content = content
+
+    # Apply fixes for Python 3 and modern msgpack.
     if "e.message" in content:
         content = content.replace("e.message", "e.args[0]")
+
+    content = content.replace(
+        "msgpack.Packer(encoding=encodings[0], default=lambda x: x.to_msgpack())",
+        "msgpack.Packer(default=lambda x: x.to_msgpack())",
+    )
+    content = content.replace(
+        "msgpack.Unpacker(encoding=encodings[1])",
+        "msgpack.Unpacker(raw=False)",
+    )
+
+    if content != original_content:
         with open(tcp_py, "w", encoding="utf-8") as f:
             f.write(content)
-        print("msgpackrpc successfully patched for Python 3 compatibility!")
+        print("msgpackrpc successfully patched for Python 3 and modern msgpack!")
     else:
-        print("msgpackrpc is already patched or 'e.message' not found.")
+        print("msgpackrpc is already patched.")
 
 if __name__ == "__main__":
     patch_msgpackrpc()
