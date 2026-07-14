@@ -19,14 +19,16 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<(&'static str, String)>();
 
-    let tx_cam = tx.clone();
-    thread::spawn(move || {
-        runpythonfile_stream(
-            "python/cone_detection/camera_cone_detection.py",
-            "camera_cone_detection.py",
-            tx_cam,
-        );
-    });
+    // YOLO runs inside python/test.py. Keep the standalone detector disabled
+    // to avoid loading and executing the same model twice.
+    // let tx_cam = tx.clone();
+    // thread::spawn(move || {
+    //     runpythonfile_stream(
+    //         "python/cone_detection/camera_cone_detection.py",
+    //         "camera_cone_detection.py",
+    //         tx_cam,
+    //     );
+    // });
 
 
 
