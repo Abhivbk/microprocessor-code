@@ -2,22 +2,42 @@ import mmap
 import struct
 from pathlib import Path
 import numpy as np
-import cv2
-import numpy as np
-
 CAM_FILE_PATH = Path(__file__).resolve().parents[3] / "sharedmemory" / "forground" / "cam.bin"
+HEADER_SIZE = 48
+_mapped_file = _mapped_view = None
+_mapped_size = 0
+_mapped_path = None
 
-def save_to_shared_memory(frame, filename=CAM_FILE_PATH):
+
+def _open_map(path, size):
+    """Reuse one map; a zero sequence means the payload is being replaced."""
+    global _mapped_file, _mapped_view, _mapped_size, _mapped_path
+    if _mapped_view is not None and _mapped_size == size and _mapped_path == path:
+        return _mapped_view
+    if _mapped_view is not None:
+        _mapped_view.close()
+        _mapped_file.close()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as stream:
+        stream.truncate(size)
+    _mapped_file = open(path, "r+b")
+    _mapped_view = mmap.mmap(_mapped_file.fileno(), size)
+    _mapped_size = size
+    _mapped_path = path
+    return _mapped_view
+
+def save_to_shared_memory(frame, timestamp_ns=0, sequence=0, filename=CAM_FILE_PATH):
     """
     Save camera frame / cam_panel to a memory-mapped binary file.
 
     Format:
-    bytes 0-31   : header
+    bytes 0-47   : header (shape, dtype, simulator timestamp, pair sequence)
         uint64 height
         uint64 width
         uint64 channels
         uint64 dtype_code  # 1 = uint8
-    bytes 32-end : raw image bytes
+        uint64 timestamp_ns
+    bytes 48-end : raw image bytes
     """
 
     if frame is None:
@@ -33,42 +53,15 @@ def save_to_shared_memory(frame, filename=CAM_FILE_PATH):
 
     height, width, channels = frame.shape
 
-    HEADER_SIZE = 32
     DTYPE_CODE_UINT8 = 1
     image_size = height * width * channels
     total_size = HEADER_SIZE + image_size
 
-    out_path = Path(filename)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
     frame_bytes = frame.tobytes()
-
-    import time
-    for attempt in range(25):
-        try:
-            with open(out_path, "wb") as f:
-                f.write(b"\x00" * total_size)
-
-            with open(out_path, "r+b") as f:
-                ram = mmap.mmap(f.fileno(), total_size)
-
-                ram[0:32] = struct.pack(
-                    "QQQQ",
-                    height,
-                    width,
-                    channels,
-                    DTYPE_CODE_UINT8
-                )
-
-                ram[HEADER_SIZE:HEADER_SIZE + image_size] = frame_bytes
-
-                ram.flush()
-                ram.close()
-            break
-        except (PermissionError, OSError) as e:
-            if attempt == 24:
-                print(f"[warning] Failed to write camera shared memory: {e}")
-            time.sleep(0.005)
-
-
-
+    ram = _open_map(Path(filename), total_size)
+    ram[:HEADER_SIZE] = struct.pack("QQQQQQ", height, width, channels, DTYPE_CODE_UINT8, 0, 0)
+    ram[HEADER_SIZE:] = frame_bytes
+    ram[:HEADER_SIZE] = struct.pack(
+        "QQQQQQ", height, width, channels, DTYPE_CODE_UINT8,
+        int(timestamp_ns), int(sequence),
+    )

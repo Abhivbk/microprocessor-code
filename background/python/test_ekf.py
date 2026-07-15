@@ -59,11 +59,34 @@ class TestEKFSLAM(unittest.TestCase):
         self.assertEqual(self.ekf.landmarks[0]["hit_count"], 2)
         self.assertEqual(len(self.ekf.x), 5)
 
-        # 3. Observe blue cone, should add a new landmark because colors are different
-        meas3 = [{"range": 5.0, "bearing": 0.0, "color": "blue"}]
+        # 3. A different colour at the same geometry is treated as corrected
+        # semantic evidence, not a duplicate landmark. A geometrically distinct
+        # cone must create the second landmark.
+        meas3 = [{"range": 5.0, "bearing": 1.0, "color": "blue"}]
         self.ekf.update(meas3)
         self.assertEqual(len(self.ekf.landmarks), 2)
         self.assertEqual(len(self.ekf.x), 7)
+
+    def test_unknown_landmark_is_recoloured_without_duplication(self):
+        unknown = [{
+            "range": 6.0,
+            "bearing": 0.2,
+            "color": "unknown",
+            "candidate_id": 42,
+        }]
+        self.ekf.update(unknown)
+        self.assertEqual(len(self.ekf.landmarks), 1)
+        self.assertEqual(self.ekf.landmarks[0]["color"], "unknown")
+
+        coloured = [{
+            "range": 6.0,
+            "bearing": 0.2,
+            "color": "blue",
+            "candidate_id": 42,
+        }]
+        self.ekf.update(coloured)
+        self.assertEqual(len(self.ekf.landmarks), 1)
+        self.assertEqual(self.ekf.landmarks[0]["color"], "blue")
 
 
 if __name__ == "__main__":

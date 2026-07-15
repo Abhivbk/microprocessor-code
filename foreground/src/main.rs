@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
@@ -9,14 +9,34 @@ fn main() {
     let (tx, rx) = mpsc::channel::<(&'static str, String)>();
 
     let tx_engine = tx.clone();
-    let handle_engine = thread::spawn(move || {
+    let _handle_engine = thread::spawn(move || {
         runpythonfile_stream("python/engine.py", "engine.py", tx_engine);
     });
 
-    // Give FSDS time to start
-    thread::sleep(Duration::from_secs(30));
-
-
+    // Start the sensor/control nodes as soon as engine.py has either attached
+    // to an existing simulator or launched one and verified its RPC API.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(180)) {
+            Ok((tag, line)) => {
+                println!("[{tag}] {line}");
+                if tag == "engine.py" && line.trim() == "FSDS_READY" {
+                    break;
+                }
+                if tag == "engine.py" && line.contains("[process exited]") {
+                    eprintln!("FSDS startup helper exited before the simulator was ready.");
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                eprintln!("Timed out waiting for the FSDS RPC API.");
+                return;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                eprintln!("FSDS startup channel disconnected.");
+                return;
+            }
+        }
+    }
 
     let tx_control = tx.clone();
     let handle_control = thread::spawn(move || {

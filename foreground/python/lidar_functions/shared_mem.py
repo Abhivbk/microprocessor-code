@@ -1,71 +1,54 @@
-import os
 import mmap
 import struct
 from pathlib import Path
-file_path = Path(__file__).resolve().parents[3] / "sharedmemory" / "forground" / "lid.bin"
 
-def save_to_shared_memory(points, filename=None):
-    """Save a collection of (x, y) points to a binary file using memory‑mapped I/O.
+import numpy as np
 
-    If *filename* is not provided, the default path defined by *file_path* is used.
-    The function creates the target directory if it does not exist.
-    """
-    if filename:
-        out_paths = [Path(filename)]
-    else:
-        out_paths = [
-            file_path,
-            file_path.parent / "lidar.bin"
-        ]
 
-    for path in out_paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
+FILE_PATH = Path(__file__).resolve().parents[3] / "sharedmemory" / "forground" / "lid.bin"
+HEADER_SIZE = 24
+_mapped_file = _mapped_view = None
+_mapped_capacity = 0
+_mapped_path = None
 
-    num_points = len(points)
-    HEADER_SIZE = 8
-    PAIR_SIZE = 16
-    total_size = HEADER_SIZE + num_points * PAIR_SIZE
 
-    import time
-    for out_path in out_paths:
-        for attempt in range(25):
-            try:
-                # Pre‑allocate file with zeroes
-                with open(out_path, "wb") as f:
-                    f.write(b"\x00" * total_size)
+def _open_map(path, required_points):
+    """Grow geometrically, then reuse the map for later scans."""
+    global _mapped_file, _mapped_view, _mapped_capacity, _mapped_path
+    if _mapped_view is not None and required_points <= _mapped_capacity and _mapped_path == path:
+        return _mapped_view
+    if _mapped_view is not None:
+        _mapped_view.close()
+        _mapped_file.close()
+    _mapped_capacity = max(64, 1 << max(0, required_points - 1).bit_length())
+    size = HEADER_SIZE + _mapped_capacity * 16
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as stream:
+        stream.truncate(size)
+    _mapped_file = open(path, "r+b")
+    _mapped_view = mmap.mmap(_mapped_file.fileno(), size)
+    _mapped_path = path
+    return _mapped_view
 
-                # Memory‑map and write data
-                with open(out_path, "r+b") as f:
-                    ram = mmap.mmap(f.fileno(), total_size)
-                    ram[0:8] = struct.pack("Q", num_points)
-                    offset = HEADER_SIZE
-                    for x, y in points:
-                        ram[offset:offset+8] = struct.pack("d", x)
-                        offset += 8
-                        ram[offset:offset+8] = struct.pack("d", y)
-                        offset += 8
-                    ram.flush()
-                    ram.close()
-                break
-            except (PermissionError, OSError) as e:
-                if attempt == 24:
-                    print(f"[warning] Failed to write lidar shared memory to {out_path}: {e}")
-                time.sleep(0.005)
+
+def save_to_shared_memory(points, timestamp_ns=0, sequence=0, filename=None):
+    """Publish one LiDAR scan without recreating the file each frame."""
+    path = Path(filename) if filename else FILE_PATH
+    array = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    count = len(array)
+    ram = _open_map(path, count)
+    ram[:HEADER_SIZE] = struct.pack("QQQ", 0, 0, 0)
+    if count:
+        ram[HEADER_SIZE:HEADER_SIZE + count * 16] = array.tobytes()
+    ram[:HEADER_SIZE] = struct.pack("QQQ", count, int(timestamp_ns), int(sequence))
+
 
 def save_to_txt(points, filename="pointcloudelidar.txt"):
-    """
-    Saves a collection of 2D coordinates (x, y) to a text file.
-    Each line in the file will contain a coordinate pair formatted as 'x,y'.
-    """
+    """Write optional human-readable LiDAR coordinates for debugging."""
+    path = Path(__file__).resolve().parent / filename
     try:
-        # Resolve path relative to the directory of this file (lidar_functions/)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        filepath = os.path.join(current_dir, filename)
-        
-        with open(filepath, "w") as f:
-            for pt in points:
-                f.write(f"{pt[0]},{pt[1]}\n")
-    except Exception as e:
-        print(f"[shared_mem] Error saving points to {filename}: {e}")
-
-
+        with open(path, "w") as stream:
+            for x, y in points:
+                stream.write(f"{x},{y}\n")
+    except OSError as error:
+        print(f"[shared_mem] Error saving points to {filename}: {error}")

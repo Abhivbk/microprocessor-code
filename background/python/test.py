@@ -2,6 +2,7 @@ import struct
 import json
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
@@ -25,6 +26,49 @@ IMU_BIN_PATH = os.path.join(SHARED_MEM_DIR_FG, "ekfin_imu_groundspeed_gyro.bin")
 ACT_BIN_PATH = os.path.join(SHARED_MEM_DIR_FG, "abs_current.bin")
 LIDAR_BIN_PATH = os.path.join(SHARED_MEM_DIR_FG, "lid.bin")
 CONTROLS_PATH = os.path.join(SHARED_MEM_DIR_BG, "control_instruction.bin")
+CAMERA_HORIZONTAL_FOV_DEGREES = 90.0
+MIN_GEOMETRY_CONFIRMATIONS = 3
+MIN_INITIAL_MAP_LANDMARKS = 4
+INITIAL_MAP_STABLE_SCANS = 5
+IMU_FRESHNESS_LIMIT_MS = 500
+MAX_SENSOR_SYNC_NS = 50_000_000
+COLOR_SYNC_WAIT_S = 0.060
+PENDING_COLOR_MAX = 8
+CAMERA_X_M = -0.30
+CAMERA_Y_M = -0.16
+LIDAR_X_M = 0.45
+LIDAR_Y_M = 0.0
+LIDAR_PROJECTION_MARGIN_PX = 10.0
+CANDIDATE_MAX_RANGE_M = 12.0
+COLOR_MAX_RANGE_M = 10.0
+YOLO_BASE_CONFIDENCE = 0.60
+YOLO_MIN_CONFIDENCE = 0.45
+COLOR_CONFIRM_SCORE = 0.90
+COLOR_CONFIRM_MARGIN = 0.35
+MIN_COLOR_WINNER_SHARE = 0.75
+CANDIDATE_BASE_GATE_M = 0.45
+CANDIDATE_MAX_GATE_M = 1.20
+CANDIDATE_EXPIRY_SCANS = 20
+BOUNDARY_NEIGHBOR_RANGE_M = 8.0
+BOUNDARY_MAX_ERROR_M = 1.0
+ORANGE_GROUP_RANGE_M = 6.0
+MAP_WIDTH_PX = 700
+MAP_HEIGHT_PX = 700
+MAP_EMBED_SIZE_PX = 440
+LIDAR_EMBED_HEIGHT_PX = 320
+MAP_MARGIN_PX = 45
+MAP_INITIAL_HALF_SPAN_M = 15.0
+MAP_EDGE_PADDING_M = 5.0
+MAP_EXPANSION_FRACTION = 0.25
+UI_BG = "#0d1117"
+UI_PANEL = "#161b22"
+UI_BORDER = "#30363d"
+UI_ACCENT = "#58a6ff"
+UI_TEXT = "#f0f6fc"
+UI_MUTED = "#8b949e"
+UI_BUTTON = "#21262d"
+UI_DANGER = "#da3633"
+UI_SUCCESS = "#238636"
 
 
 class TestConsoleApp:
@@ -32,7 +76,13 @@ class TestConsoleApp:
         self.root = root
         self.root.title("FSDS Test Console")
         self.root.geometry("1550x950")
-        self.root.configure(bg="#101010")
+        self.root.configure(bg=UI_BG)
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(
+            "TScale", background=UI_PANEL, troughcolor=UI_BORDER,
+            bordercolor=UI_PANEL, lightcolor=UI_ACCENT, darkcolor=UI_ACCENT,
+        )
 
         self.latest_imu = None
         self.imu_feedback_fresh = False
@@ -57,6 +107,8 @@ class TestConsoleApp:
             "brake": 1.0,
             "steering": 0.0,
         }
+        self.desired_lock = threading.Lock()
+        self.desired = dict(self.manual_desired)
 
         # Initialize EKF SLAM state estimator
         self.ekf = EKFSLAM()
@@ -90,6 +142,7 @@ class TestConsoleApp:
         self.using_keyboard = False
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.bind("<KeyRelease>", self._on_key_release)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_ui()
         self._create_map_window()
@@ -99,6 +152,7 @@ class TestConsoleApp:
         threading.Thread(target=self._yolo_worker_thread, daemon=True).start()
 
         self.root.after(50, self.refresh_ui)
+        self.root.after(100, self._refresh_embedded_map)
 
     def _build_ui(self):
         title = tk.Label(
@@ -115,7 +169,7 @@ class TestConsoleApp:
 
         left = tk.Frame(main, bg="#101010")
         left.pack(side="left", fill="both", expand=False)
-        right = tk.Frame(main, bg="#101010")
+        right = tk.Frame(main, bg=UI_BG)
         right.pack(side="right", fill="both", expand=True)
 
         # Split left panel into three columns for layout compacting on laptop screens
@@ -162,14 +216,23 @@ class TestConsoleApp:
         ).pack(pady=(0, 8))
 
     def _make_section(self, parent, title_text):
-        frame = tk.LabelFrame(parent, text=title_text, fg="cyan", bg="#181818", font=("Arial", 12, "bold"), bd=2)
+        frame = tk.LabelFrame(
+            parent, text=title_text, fg=UI_ACCENT, bg=UI_PANEL,
+            font=("Segoe UI", 11, "bold"), bd=0, relief="flat",
+            highlightthickness=1, highlightbackground=UI_BORDER,
+        )
         frame.pack(fill="x", padx=8, pady=8)
         return frame
 
-    def _build_slam_panel(self, parent):
-        frame = self._make_section(parent, "EKF SLAM Measurements (Range, Bearing)")
-        self.slam_text_var = tk.StringVar(value="No detections yet")
-        tk.Label(frame, textvariable=self.slam_text_var, fg="yellow", bg="#181818", font=("Consolas", 10), justify="left", anchor="w").pack(fill="x", padx=12, pady=8)
+    @staticmethod
+    def _make_button(parent, text, command, width=15, danger=False):
+        return tk.Button(
+            parent, text=text, command=command, width=width,
+            bg=UI_DANGER if danger else UI_BUTTON, fg=UI_TEXT,
+            activebackground="#f85149" if danger else UI_BORDER,
+            activeforeground=UI_TEXT, relief="flat", bd=0,
+            font=("Segoe UI", 9), cursor="hand2", padx=6, pady=5,
+        )
 
     def _build_controls_panel(self, parent):
         frame = self._make_section(parent, "Control Output -> SHM")
@@ -182,14 +245,14 @@ class TestConsoleApp:
         self.brake_label = tk.StringVar(value="Brake: 0.000")
         self.steering_label = tk.StringVar(value="Steering: 0.000")
 
-        tk.Label(frame, textvariable=self.throttle_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(8, 2))
+        tk.Label(frame, textvariable=self.throttle_label, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(8, 2))
         ttk.Scale(frame, from_=0.0, to=1.0, variable=self.throttle_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
-        tk.Label(frame, textvariable=self.brake_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(frame, textvariable=self.brake_label, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Scale(frame, from_=0.0, to=1.0, variable=self.brake_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
-        tk.Label(frame, textvariable=self.steering_label, fg="white", bg="#181818", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
+        tk.Label(frame, textvariable=self.steering_label, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 10)).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Scale(frame, from_=-1.0, to=1.0, variable=self.steering_var, orient="horizontal", command=self.on_slider_change).pack(fill="x", padx=12)
 
-        button_row = tk.Frame(frame, bg="#181818")
+        button_row = tk.Frame(frame, bg=UI_PANEL)
         button_row.pack(fill="x", padx=12, pady=12)
         tk.Button(button_row, text="Center Steering", command=self.center_steering, width=15).pack(side="left", padx=4)
         tk.Button(button_row, text="Zero Throttle", command=self.zero_throttle, width=15).pack(side="left", padx=4)
@@ -223,7 +286,7 @@ class TestConsoleApp:
         self.ctrl_status_var = tk.StringVar(value="Control TX: Writing")
 
         for var in [self.imu_status_var, self.act_status_var, self.vision_status_var, self.ctrl_status_var]:
-            tk.Label(frame, textvariable=var, fg="white", bg="#181818", font=("Arial", 11), anchor="w").pack(fill="x", padx=12, pady=4)
+            tk.Label(frame, textvariable=var, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 10), anchor="w").pack(fill="x", padx=12, pady=4)
 
     def _build_imu_panel(self, parent):
         frame = self._make_section(parent, "SHM - IMU + Speed")
@@ -234,7 +297,7 @@ class TestConsoleApp:
         self.ori_var = tk.StringVar(value="Orientation: ---")
 
         for var in [self.speed_var, self.ang_var, self.lin_var, self.ori_var]:
-            tk.Label(frame, textvariable=var, fg="white", bg="#181818", font=("Arial", 10), justify="left", anchor="w").pack(fill="x", padx=12, pady=4)
+            tk.Label(frame, textvariable=var, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 9), justify="left", anchor="w").pack(fill="x", padx=12, pady=4)
 
     def _build_actuator_panel(self, parent):
         frame = self._make_section(parent, "SHM - Actuator State")
@@ -244,7 +307,7 @@ class TestConsoleApp:
         self.act_steering_var = tk.StringVar(value="Steering: ---")
 
         for var in [self.act_throttle_var, self.act_brake_var, self.act_steering_var]:
-            tk.Label(frame, textvariable=var, fg="white", bg="#181818", font=("Arial", 11), anchor="w").pack(fill="x", padx=12, pady=4)
+            tk.Label(frame, textvariable=var, fg=UI_TEXT, bg=UI_PANEL, font=("Segoe UI", 10), anchor="w").pack(fill="x", padx=12, pady=4)
 
     def _build_vision_panel(self, parent):
         frame = tk.LabelFrame(
@@ -256,8 +319,109 @@ class TestConsoleApp:
             bd=2
         )
         frame.pack(fill="both", expand=True, padx=8, pady=8)
-        self.image_label = tk.Label(frame, bg="black")
-        self.image_label.pack(fill="both", expand=True, padx=10, pady=10)
+        frame.configure(width=MAP_EMBED_SIZE_PX, height=LIDAR_EMBED_HEIGHT_PX)
+        frame.pack_propagate(False)
+        self.lidar_label = tk.Label(frame, bg="#080b10")
+        self.lidar_label.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _refresh_embedded_map(self):
+        """Render the map independently at 10 Hz to protect video responsiveness."""
+        if self.shutdown_event.is_set():
+            return
+        self.root.after(100, self._refresh_embedded_map)
+        try:
+            map_image = Image.fromarray(self._draw_ekf_map())
+            available = min(self.map_label.winfo_width(), self.map_label.winfo_height())
+            display_size = min(MAP_EMBED_SIZE_PX, available if available > 100 else 420)
+            map_image = map_image.resize(
+                (display_size, display_size), Image.Resampling.LANCZOS,
+            )
+            tk_map = ImageTk.PhotoImage(map_image)
+            self.map_label.configure(image=tk_map)
+            self.map_label.image = tk_map
+        except Exception as error:
+            print(f"[Dashboard] Error updating embedded EKF map: {error}")
+
+    @staticmethod
+    def _display_sensor_image(label, array, fallback_size):
+        """Fit a sensor image inside its card without changing its aspect ratio."""
+        image = Image.fromarray(array)
+        width, height = label.winfo_width(), label.winfo_height()
+        limit = (
+            width if width > 100 else fallback_size[0],
+            height if height > 100 else fallback_size[1],
+        )
+        image.thumbnail(limit, Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        label.configure(image=photo)
+        label.image = photo
+
+    def _set_desired(self, command):
+        """Validate and select the command that will be sent to foreground."""
+        throttle = float(command["throttle"])
+        brake = float(command["brake"])
+        steering = float(command["steering"])
+
+        if not all(math.isfinite(value) for value in (throttle, brake, steering)):
+            raise ValueError("Control command contains a non-finite value")
+
+        selected = {
+            "throttle": max(0.0, min(1.0, throttle)),
+            "brake": max(0.0, min(1.0, brake)),
+            "steering": max(-1.0, min(1.0, steering)),
+        }
+        with self.desired_lock:
+            self.desired.update(selected)
+
+    def _get_desired(self):
+        with self.desired_lock:
+            return dict(self.desired)
+
+    def _disable_autonomy(self, reason):
+        """Return to manual mode with a safe full-brake command."""
+        self.autonomous_mode = False
+        self.using_keyboard = False
+        self.manual_desired.update({
+            "throttle": 0.0,
+            "brake": 1.0,
+            "steering": 0.0,
+        })
+        self._set_desired(self.manual_desired)
+        self._update_autonomy_ui()
+        print(f"[Dashboard] Autonomous mode disabled: {reason}")
+
+    def _update_autonomy_ui(self):
+        if self.autonomous_mode:
+            self.autonomy_button_text.set("Disable Autonomy")
+            if hasattr(self, "autonomy_button"):
+                self.autonomy_button.configure(bg=UI_DANGER, activebackground="#f85149")
+        else:
+            self.autonomy_button_text.set("Enable Autonomy")
+            if hasattr(self, "autonomy_button"):
+                self.autonomy_button.configure(bg=UI_SUCCESS, activebackground="#2ea043")
+
+    def _set_autonomy_status(self, status):
+        if status != getattr(self, "autonomy_status", None):
+            self.autonomy_status = status
+            print(f"[Autonomy] {status}", flush=True)
+
+    def toggle_autonomy(self):
+        """Single toggle used by both the UI button and the P key."""
+        self.autonomous_mode = not self.autonomous_mode
+        if self.autonomous_mode:
+            self.using_keyboard = False
+            if hasattr(self, "controller"):
+                self.controller.path_started_at = None
+            self.steering_var.set(0.0)
+            self.throttle_var.set(0.0)
+            self.brake_var.set(1.0)
+            self.on_slider_change()
+            self._set_autonomy_status("ENABLED: evaluating map")
+        else:
+            self._set_desired(self.manual_desired)
+            self._set_autonomy_status("IDLE")
+        self._update_autonomy_ui()
+        print(f"[Dashboard] Autonomous Mode: {self.autonomous_mode}")
 
     def _build_tuning_panel(self, parent):
         frame = self._make_section(parent, "Autonomous Controller Tuning")
@@ -388,14 +552,15 @@ class TestConsoleApp:
         self.on_slider_change()
 
     def _shm_reader_thread(self):
-        while True:
+        while not self.shutdown_event.is_set():
             try:
                 if os.path.exists(IMU_BIN_PATH):
                     try:
                         with open(IMU_BIN_PATH, "rb") as f:
-                            if os.fstat(f.fileno()).st_size >= 52:
-                                ram = mmap.mmap(f.fileno(), 52, access=mmap.ACCESS_READ)
-                                t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = struct.unpack("<Q11f", ram[0:52])
+                            if os.fstat(f.fileno()).st_size >= 60:
+                                ram = mmap.mmap(f.fileno(), 60, access=mmap.ACCESS_READ)
+                                values = struct.unpack("<QQ11f", ram[0:60])
+                                t, sensor_t, spd, ax, ay, az, lx, ly, lz, ox, oy, oz, ow = values
                                 self.latest_imu = {
                                     "timestamp_ms": t,
                                     "ground_speed_mps": spd,
@@ -488,7 +653,79 @@ class TestConsoleApp:
                         pass
             except Exception as e:
                 pass
-            time.sleep(0.033)
+            self.shutdown_event.wait(0.033)
+
+    @staticmethod
+    def _read_camera():
+        if not os.path.exists(CAM_BIN_PATH):
+            return None
+        with open(CAM_BIN_PATH, "rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size < 48:
+                return None
+            ram = mmap.mmap(stream.fileno(), size, access=mmap.ACCESS_READ)
+            header = bytes(ram[:48])
+            h, w, channels, _, timestamp, sequence = struct.unpack("QQQQQQ", header)
+            image_size = int(h * w * channels)
+            if not sequence or size < 48 + image_size:
+                ram.close()
+                return None
+            payload = bytes(ram[48:48 + image_size])
+            stable = header == bytes(ram[:48])
+            ram.close()
+        if not stable:
+            return None
+        image = np.frombuffer(payload, np.uint8).reshape(int(h), int(w), int(channels))
+        return image, int(timestamp), int(sequence)
+
+    @staticmethod
+    def _read_lidar():
+        if not os.path.exists(LIDAR_BIN_PATH):
+            return None
+        with open(LIDAR_BIN_PATH, "rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size < 24:
+                return None
+            ram = mmap.mmap(stream.fileno(), size, access=mmap.ACCESS_READ)
+            header = bytes(ram[:24])
+            count, timestamp, sequence = struct.unpack("QQQ", header)
+            if not sequence or size < 24 + count * 16:
+                ram.close()
+                return None
+            payload = bytes(ram[24:24 + count * 16])
+            stable = header == bytes(ram[:24])
+            ram.close()
+        if not stable:
+            return None
+        points = np.frombuffer(payload, dtype=np.float64).reshape(-1, 2)
+        scale, center_x, center_y = (540 - 80) / 20.0, 350, 500
+        cones = [(int(center_x + y * scale), int(center_y - x * scale), math.hypot(x, y), y, x)
+                 for x, y in points]
+        return int(timestamp), cones, int(sequence)
+
+    def _queue_mapping(self, kind, measurements):
+        if not measurements:
+            return
+        try:
+            self.mapping_queue.put_nowait((kind, measurements))
+        except queue.Full:
+            self.metrics["mapping_drops"] += 1
+
+    @staticmethod
+    def _lidar_observations(cones, timestamp):
+        observations = []
+        for px, py, _, left, forward in cones:
+            vehicle_x, vehicle_y = forward + LIDAR_X_M, left + LIDAR_Y_M
+            distance = math.hypot(vehicle_x, vehicle_y)
+            if 0.5 <= distance <= CANDIDATE_MAX_RANGE_M:
+                observations.append({
+                    "label": "unknown", "color": "unknown", "conf": 0.0,
+                    "cam_box": None, "box_height": 0.0,
+                    "lidar_pixel": [int(px), int(py)], "range": distance,
+                    "bearing": math.atan2(vehicle_y, vehicle_x),
+                    "lidar_timestamp_ns": int(timestamp),
+                })
+        return observations
 
     def _shm_writer_thread(self):
         os.makedirs(SHARED_MEM_DIR_BG, exist_ok=True)
@@ -683,9 +920,13 @@ class TestConsoleApp:
         qz = 0.0
         qw = 1.0
         if self.latest_imu:
+            receipt_timestamp_ms = int(self.latest_imu.get("timestamp_ms", 0))
+            sensor_timestamp_ns = int(self.latest_imu.get("sensor_timestamp_ns", 0))
             speed = self.latest_imu.get("ground_speed_mps", 0.0)
             yaw_rate = self.latest_imu.get("imu", {}).get("angular_velocity", {}).get("z", 0.0)
             ori = self.latest_imu.get("imu", {}).get("orientation", {})
+            qx = ori.get("x", 0.0)
+            qy = ori.get("y", 0.0)
             qz = ori.get("z", 0.0)
             qw = ori.get("w", 1.0)
 
@@ -698,6 +939,8 @@ class TestConsoleApp:
                 self.ekf.x[2] = abs_theta
                 self.ekf.heading_initialized = True
             else:
+                if dt > 0.0:
+                    self.ekf.predict(speed, yaw_rate, dt)
                 self.ekf.update_heading(abs_theta)
 
         # EKF SLAM Update Step
@@ -839,7 +1082,90 @@ class TestConsoleApp:
         else:
             self.slam_text_var.set("No detections")
 
-        self.root.after(50, self.refresh_ui)
+    def _world_to_map_pixel(self, world_x, world_y):
+        usable_width = MAP_WIDTH_PX - 2 * MAP_MARGIN_PX
+        usable_height = MAP_HEIGHT_PX - 2 * MAP_MARGIN_PX
+        px = MAP_MARGIN_PX + (
+            (world_x - self.map_x_min_m) / (self.map_x_max_m - self.map_x_min_m)
+        ) * usable_width
+        py = MAP_HEIGHT_PX - MAP_MARGIN_PX - (
+            (world_y - self.map_y_min_m) / (self.map_y_max_m - self.map_y_min_m)
+        ) * usable_height
+        return int(round(px)), int(round(py))
+
+    @staticmethod
+    def _nice_grid_spacing(span_m):
+        """Choose a readable 1/2/5 x 10^n grid interval."""
+        target = max(1.0, float(span_m) / 8.0)
+        exponent = math.floor(math.log10(target))
+        fraction = target / (10.0 ** exponent)
+        if fraction <= 1.0:
+            nice_fraction = 1.0
+        elif fraction <= 2.0:
+            nice_fraction = 2.0
+        elif fraction <= 5.0:
+            nice_fraction = 5.0
+        else:
+            nice_fraction = 10.0
+        return nice_fraction * (10.0 ** exponent)
+
+    def _update_map_bounds(self):
+        """Expand the world viewport to include the car and EKF landmarks."""
+        points = [(float(self.ekf.x[0]), float(self.ekf.x[1]))]
+        for index in range(len(self.ekf.landmarks)):
+            lx_index = 3 + 2 * index
+            ly_index = 4 + 2 * index
+            if ly_index < len(self.ekf.x):
+                point = (float(self.ekf.x[lx_index]), float(self.ekf.x[ly_index]))
+                if all(math.isfinite(value) for value in point):
+                    points.append(point)
+
+        finite_points = [
+            point for point in points if all(math.isfinite(value) for value in point)
+        ]
+        if not finite_points:
+            return
+
+        wanted_x_min = min(point[0] for point in finite_points) - MAP_EDGE_PADDING_M
+        wanted_x_max = max(point[0] for point in finite_points) + MAP_EDGE_PADDING_M
+        wanted_y_min = min(point[1] for point in finite_points) - MAP_EDGE_PADDING_M
+        wanted_y_max = max(point[1] for point in finite_points) + MAP_EDGE_PADDING_M
+
+        current_span = max(
+            self.map_x_max_m - self.map_x_min_m,
+            self.map_y_max_m - self.map_y_min_m,
+        )
+        expansion_step = max(MAP_EDGE_PADDING_M, current_span * MAP_EXPANSION_FRACTION)
+
+        if wanted_x_min < self.map_x_min_m:
+            self.map_x_min_m = min(wanted_x_min, self.map_x_min_m - expansion_step)
+        if wanted_x_max > self.map_x_max_m:
+            self.map_x_max_m = max(wanted_x_max, self.map_x_max_m + expansion_step)
+        if wanted_y_min < self.map_y_min_m:
+            self.map_y_min_m = min(wanted_y_min, self.map_y_min_m - expansion_step)
+        if wanted_y_max > self.map_y_max_m:
+            self.map_y_max_m = max(wanted_y_max, self.map_y_max_m + expansion_step)
+
+        # The plot is square, so equalize the world spans. This prevents visual
+        # distortion: one metre in X always occupies the same pixels as one in Y.
+        x_span = self.map_x_max_m - self.map_x_min_m
+        y_span = self.map_y_max_m - self.map_y_min_m
+        if x_span < y_span:
+            extra = y_span - x_span
+            self.map_x_min_m -= extra / 2.0
+            self.map_x_max_m += extra / 2.0
+        elif y_span < x_span:
+            extra = x_span - y_span
+            self.map_y_min_m -= extra / 2.0
+            self.map_y_max_m += extra / 2.0
+
+    @staticmethod
+    def _pixel_is_on_map(pixel):
+        px, py = pixel
+        return (
+            MAP_MARGIN_PX <= px <= MAP_WIDTH_PX - MAP_MARGIN_PX
+            and MAP_MARGIN_PX <= py <= MAP_HEIGHT_PX - MAP_MARGIN_PX
+        )
 
     def _draw_ekf_map(self):
         # Create a blank 540x540 image

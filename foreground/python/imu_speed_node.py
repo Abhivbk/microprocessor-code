@@ -12,7 +12,8 @@ VEHICLE_NAME = "FSCar"
 SHARED_MEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sharedmemory", "forground"))
 IMU_BIN_PATH = os.path.join(SHARED_MEM_DIR, "ekfin_imu_groundspeed_gyro.bin")
 
-BINARY_FORMAT = "<Q11f"
+# Receipt time detects frozen SHM; simulator time aligns IMU, camera and LiDAR.
+BINARY_FORMAT = "<QQ11f"
 STRUCT_SIZE = struct.calcsize(BINARY_FORMAT)
 
 def connect_fsds_forever():
@@ -54,6 +55,7 @@ def update_imu():
                 packed_data = struct.pack(
                     BINARY_FORMAT,
                     now_ms,
+                    int(imu_data.time_stamp or state.timestamp),
                     speed,
                     float(ang_vel.x_val), float(ang_vel.y_val), float(ang_vel.z_val),
                     float(lin_acc.x_val), float(lin_acc.y_val), float(lin_acc.z_val),

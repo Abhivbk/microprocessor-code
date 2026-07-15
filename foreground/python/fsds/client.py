@@ -183,6 +183,20 @@ class FSDSClient:
         """
         self.client.call('setCarControls', controls, vehicle_name)
 
+    def getCarControls(self, vehicle_name = 'FSCar'):
+        """
+        Get the throttle, steering, brake, and gear controls currently held
+        by the simulator for the selected vehicle.
+
+        Args:
+            vehicle_name (str, optional): Name of vehicle
+
+        Returns:
+            CarControls:
+        """
+        controls_raw = self.client.call('getCarControls', vehicle_name)
+        return CarControls.from_msgpack(controls_raw)
+
     def getCarState(self, vehicle_name = 'FSCar'):
         """
         Args:
